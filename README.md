@@ -254,3 +254,7 @@ curl -sN http://127.0.0.1:8900/chat_stream \
 ## License
 
 AGPL-3.0-or-later. Copyright © 2026 blanche.x. Extracted from the production-proven session continuity engine in the original project, with private identity, infrastructure, and memory-system coupling removed.
+
+## 致谢
+
+特别感谢土豆老师和蛋壳老师的分享、经验与启发。
