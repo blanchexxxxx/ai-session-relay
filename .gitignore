@@ -1,0 +1,12 @@
+.venv/
+__pycache__/
+.pytest_cache/
+*.pyc
+*.log
+.env
+relay_state.json
+headless_last_session
+codex_last_thread
+codex_thread_epoch
+model_windows.json
+usage_log.ndjson
