@@ -92,30 +92,33 @@
 - shape 发错会被服务端视为拒绝或一直挂起。
 - 当前项目是 trusted-local autonomous 模式，`approvalPolicy=never` 并自动批准。若改安全模型，需要同时设计远端审批协议，不能只关 `_auto_approve`，否则工具 turn 会无期限等待。
 
-### resume 没回声不等于 thread 失效
+### resume 没回声不等于 thread 失效，也不等于通知流永久失效
 
 - 已捕获失败链：`thread/resume` timeout/failure 后，同一持久 app-server 上紧接 `thread/start` 也 timeout。
 - rollout 文件可能仍完好、持续增长并包含完整 final answer；timeout/EOF 只证明 response 通道静默，不能证明持久 thread 坏了。
-- 正确恢复：保留 pointer，进入 rollout observation；JSON-RPC 在同一 stdio 上有序，resume 可能已被接受，只是 ack 丢失。
+- 正确恢复：保留 pointer，并让下一轮同时观察 live notification 与 rollout；慢 resume 只记为未确认，不能设置永久 `rollout_only` 或关闭 notification queue。
 - 只有明确包含 thread missing/unknown/corrupt 语义的 RPC error 才能条件清理 pointer，再回收 app-server 并新建 thread。普通 schema error 只允许去掉可选 config 裸 resume 一次。
 
 ### rollout 完成不代表 RPC response 通道健康
 
 - Codex app-server 可能已经接收并完成 `turn/start`、把 `task_complete` 写入 rollout，却漏掉对应 RPC ack 和 turn notifications。
 - 每轮发送前记录该 thread rollout 的 byte offset；live queue 静默时只读 offset 后的新记录。必须同时看到 `task_complete` 和 final `output_text` 才能收口，且绝不读取 raw/encrypted reasoning。
-- 所有模式（包括 fresh app-server 首轮）的 `turn/start` 都只发送一次并立刻观察 rollout，不能让首轮先白等通用 RPC timeout。明确 RPC error 仍立即失败；既无 ack 又无 rollout 新字节满 `CODEX_ROLLOUT_START_TIMEOUT` 才判 transport 无进展。
+- 所有模式（包括 fresh app-server 首轮）的 `turn/start` 都立刻观察 rollout，不能让首轮先白等通用 RPC timeout。明确 RPC error 仍立即失败；既无 ack 又无 rollout 新字节满 `CODEX_ROLLOUT_START_TIMEOUT` 才判 transport 无进展。通常只发送一次；唯一例外是下节可证明“旧 transport 已死且 rollout 未增长”的安全恢复。
 - 未决 response future 在成功、异常和取消路径都必须清理，避免迟到 response 污染下一轮。
 - 长轮等待期间按 `CODEX_HEARTBEAT_SECONDS` 发轻量 keepalive；这不是 reasoning/CoT，只用于维持上游流连接和报告 elapsed time。
+- RPC response、notification 与 rollout 必须按同一个 turn id 对齐。迟到的旧 turn 事件按 id 丢弃，不能靠全局关闭通知流防串流。
 
 ### 清坏指针必须防竞态
 
 - `_clear_thread_ptr(expected)` 删除前重新读取当前值；只有仍等于 expected 才删。
 - 不带 expected 的盲删可能删除另一协程刚写入的新 thread pointer。
 
-### Codex 重试闸以“turn 是否可能已发送”为硬边界
+### Codex 重试闸以“turn 是否已有执行证据”为硬边界
 
-- `stream_codex_turn` 只有在 `turn/start` 尚未尝试写出时，才允许新进程重试一次。
-- 一旦尝试写出 turn，即使还没有任何 delta/activity，也必须假设模型或工具可能已执行，禁止重放。
+- `turn/start` 使用稳定 `clientUserMessageId`，但该字段只负责关联，不假设 app-server 会替 relay 去重。
+- 一旦已有 RPC ack、同轮 notification 或 rollout 新字节，就必须假设模型或工具可能已执行，禁止重放。
+- 若 15s 内三路均无证据，先杀死旧 app-server，使 stdin 中尚未处理的请求不可能迟到执行；再复核发送前 rollout cursor。cursor 仍未增长时才允许 fresh app-server 重发一次；增长则拒绝歧义重放。
+- keepalive/`thinking_status` 只是连接活性，不是模型执行证据，不能因为已经 yield 心跳就阻断上述安全恢复。
 - app-server EOF 时要 fail 全部 `_pending` future；否则调用者一直等到各自 timeout。
 
 ### token usage 必须取 last，不取 total
