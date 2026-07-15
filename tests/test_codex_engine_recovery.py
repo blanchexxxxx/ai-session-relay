@@ -75,6 +75,39 @@ def test_incomplete_rollout_is_never_recovered(tmp_path):
     assert codex_engine._completed_turn_from_rollout(str(rollout), 0) is None
 
 
+def test_continuation_state_and_model_aware_threshold(tmp_path, monkeypatch):
+    thread_id = "thread-pressure"
+    rollout = tmp_path / f"rollout-{thread_id}.jsonl"
+    rows = [
+        _rollout_line("event_msg", {"type": "task_started", "turn_id": "turn-1"}),
+        _rollout_line("event_msg", {
+            "type": "token_count",
+            "info": {
+                "last_token_usage": {
+                    "input_tokens": 205_000, "output_tokens": 200,
+                    "total_tokens": 205_200,
+                },
+                "model_context_window": 258_400,
+            },
+        }),
+        _rollout_line("event_msg", {"type": "task_complete", "turn_id": "turn-1"}),
+        _rollout_line("event_msg", {"type": "task_started", "turn_id": "turn-2"}),
+        json.dumps({"type": "compacted", "payload": {}}),
+    ]
+    rollout.write_text("\n".join(rows) + "\n", encoding="utf-8")
+    monkeypatch.setattr(codex_engine, "CODEX_SESSIONS_DIR", str(tmp_path))
+    codex_engine._ROLLOUT_PATH_CACHE.clear()
+
+    state = codex_engine._rollout_continuation_state(thread_id)
+
+    assert state.last_completed_usage["total_tokens"] == 205_200
+    assert state.thread_compacted is True
+    assert codex_engine._continuation_rotation_reason(state) == "native_compact"
+    assert codex_engine._continuation_trigger_tokens(200_000) == 140_000
+    assert codex_engine._continuation_trigger_tokens(258_400) == 193_800
+    assert codex_engine._continuation_trigger_tokens(1_000_000) == 250_000
+
+
 @pytest.mark.asyncio
 async def test_fresh_engine_turn_completes_without_waiting_for_rpc_ack(monkeypatch):
     server = object.__new__(codex_engine.CodexAppServer)
@@ -85,7 +118,10 @@ async def test_fresh_engine_turn_completes_without_waiting_for_rpc_ack(monkeypat
     server._served_model = "default"
     server._pending = {}
 
-    async def begin_request(_method, _params):
+    sent = []
+
+    async def begin_request(method, params):
+        sent.append((method, params))
         future = asyncio.get_running_loop().create_future()
         server._pending[9] = future
         return 9, future
@@ -113,6 +149,7 @@ async def test_fresh_engine_turn_completes_without_waiting_for_rpc_ack(monkeypat
 
     assert events[-1]["full"] == "fast reply"
     assert events[-1]["codex_turn_tokens"] == 15
+    assert sent[0][1]["approvalPolicy"] == "never"
     assert server._pending == {}
 
 
@@ -415,6 +452,98 @@ async def test_visible_failure_recycles_but_never_replays_turn(monkeypatch):
     assert get_calls == 1
     assert broken.calls == 1
     assert discarded == [broken]
+
+
+@pytest.mark.asyncio
+async def test_continuation_rotation_commits_only_after_required_handoff(
+    tmp_path, monkeypatch,
+):
+    server = object.__new__(codex_engine.CodexAppServer)
+    ptr = tmp_path / "codex_last_thread"
+    ptr.write_text("old-thread", encoding="utf-8")
+    events = []
+
+    async def start(*, persist=True):
+        events.append(("start", persist, ptr.read_text(encoding="utf-8")))
+        return "new-thread"
+
+    async def handoff(thread_id, text, *, required=False):
+        events.append(("handoff", thread_id, text, required, ptr.read_text(encoding="utf-8")))
+        return True
+
+    monkeypatch.setattr(codex_engine, "THREAD_PTR", str(ptr))
+    monkeypatch.setattr(server, "_start_fresh_thread", start)
+    monkeypatch.setattr(server, "_inject_handoff", handoff)
+
+    result = await server._rotate_for_continuation(
+        "old-thread", "recent dialogue", "context_pressure:test",
+    )
+
+    assert result == "new-thread"
+    assert events == [
+        ("start", False, "old-thread"),
+        ("handoff", "new-thread", "recent dialogue", True, "old-thread"),
+    ]
+    assert ptr.read_text(encoding="utf-8") == "new-thread"
+
+
+def test_app_server_uses_a_dedicated_posix_process_group(monkeypatch):
+    monkeypatch.setattr(codex_engine, "_USE_POSIX_PROCESS_GROUP", True)
+    assert codex_engine._app_server_process_kwargs() == {"start_new_session": True}
+
+
+@pytest.mark.asyncio
+async def test_close_kills_full_posix_process_group(monkeypatch):
+    class Process:
+        pid = 4321
+        returncode = None
+
+        async def wait(self):
+            self.returncode = -int(codex_engine._POSIX_KILL_SIGNAL)
+            return self.returncode
+
+        def kill(self):
+            raise AssertionError("must kill the full process group")
+
+    server = object.__new__(codex_engine.CodexAppServer)
+    server.proc = Process()
+    server._pending = {}
+    server._notif_q = object()
+    server._thread_id = "thread"
+    server._reader = None
+    server._stderr = None
+    killed = []
+    monkeypatch.setattr(codex_engine, "_USE_POSIX_PROCESS_GROUP", True)
+    monkeypatch.setattr(
+        codex_engine.os, "killpg",
+        lambda pid, sig: killed.append((pid, sig)), raising=False,
+    )
+
+    await server.close()
+
+    assert killed == [(4321, codex_engine._POSIX_KILL_SIGNAL)]
+
+
+@pytest.mark.asyncio
+async def test_durable_rollout_completion_keeps_silent_app_server_warm(monkeypatch):
+    class RolloutOnlyEngine:
+        _transport_desynced = True
+
+        async def stream_turn(self, *_args, **_kwargs):
+            yield {"done": True, "full": "reply"}
+
+    async def fake_get_engine():
+        return RolloutOnlyEngine()
+
+    async def must_not_discard(_engine):
+        raise AssertionError("durably completed engine must stay warm")
+
+    monkeypatch.setattr(codex_engine, "get_engine", fake_get_engine)
+    monkeypatch.setattr(codex_engine, "_discard_engine", must_not_discard)
+
+    assert await _collect(codex_engine.stream_codex_turn("hello")) == [
+        {"done": True, "full": "reply"},
+    ]
 
 
 @pytest.mark.asyncio
