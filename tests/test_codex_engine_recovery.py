@@ -76,14 +76,14 @@ def test_incomplete_rollout_is_never_recovered(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_rollout_only_turn_completes_without_waiting_for_rpc_ack(monkeypatch):
+async def test_fresh_engine_turn_completes_without_waiting_for_rpc_ack(monkeypatch):
     server = object.__new__(codex_engine.CodexAppServer)
     server._turn_lock = asyncio.Lock()
     server._thread_id = "thread-1"
     server._notif_q = None
     server._rate_limited = False
     server._served_model = "default"
-    server._rollout_only = True
+    server._rollout_only = False
     server._pending = {}
 
     async def begin_request(_method, _params):
@@ -116,14 +116,14 @@ async def test_rollout_only_turn_completes_without_waiting_for_rpc_ack(monkeypat
 
 
 @pytest.mark.asyncio
-async def test_rollout_only_turn_surfaces_explicit_rpc_error(monkeypatch):
+async def test_any_turn_surfaces_explicit_rpc_error(monkeypatch):
     server = object.__new__(codex_engine.CodexAppServer)
     server._turn_lock = asyncio.Lock()
     server._thread_id = "thread-1"
     server._notif_q = None
     server._rate_limited = False
     server._served_model = "default"
-    server._rollout_only = True
+    server._rollout_only = False
     server._pending = {}
 
     async def begin_request(_method, _params):
@@ -141,14 +141,14 @@ async def test_rollout_only_turn_surfaces_explicit_rpc_error(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_rollout_only_turn_fails_fast_without_ack_or_progress(monkeypatch):
+async def test_any_turn_fails_fast_without_ack_or_progress(monkeypatch):
     server = object.__new__(codex_engine.CodexAppServer)
     server._turn_lock = asyncio.Lock()
     server._thread_id = "thread-1"
     server._notif_q = None
     server._rate_limited = False
     server._served_model = "default"
-    server._rollout_only = True
+    server._rollout_only = False
     server._pending = {}
 
     async def begin_request(_method, _params):
@@ -166,6 +166,48 @@ async def test_rollout_only_turn_fails_fast_without_ack_or_progress(monkeypatch)
     with pytest.raises(ConnectionError, match="no RPC ack or rollout progress"):
         await asyncio.wait_for(_collect(server.stream_turn("hello")), timeout=0.2)
     assert server._pending == {}
+
+
+@pytest.mark.asyncio
+async def test_long_silent_turn_emits_keepalive_until_rollout_completes(monkeypatch):
+    server = object.__new__(codex_engine.CodexAppServer)
+    server._turn_lock = asyncio.Lock()
+    server._thread_id = "thread-1"
+    server._notif_q = None
+    server._rate_limited = False
+    server._served_model = "default"
+    server._rollout_only = False
+    server._pending = {}
+
+    async def begin_request(_method, _params):
+        future = asyncio.get_running_loop().create_future()
+        server._pending[12] = future
+        return 12, future
+
+    polls = 0
+
+    def completed(_path, _offset):
+        nonlocal polls
+        polls += 1
+        if polls < 5:
+            return None
+        return {
+            "full": "eventual reply",
+            "commentary_full": "",
+            "codex_turn_usage": codex_engine._map_usage(None),
+        }
+
+    monkeypatch.setattr(server, "_begin_request", begin_request)
+    monkeypatch.setattr(codex_engine, "_rollout_cursor", lambda _tid: ("rollout", 10))
+    monkeypatch.setattr(codex_engine, "_completed_turn_from_rollout", completed)
+    monkeypatch.setattr(codex_engine, "_rollout_has_progress", lambda _p, _o: True)
+    monkeypatch.setattr(codex_engine, "TRANSCRIPT_POLL_SECONDS", 0.001)
+    monkeypatch.setattr(codex_engine, "HEARTBEAT_SECONDS", 0.002)
+
+    events = await _collect(server.stream_turn("hello"))
+
+    assert any(event.get("thinking_status") for event in events)
+    assert events[-1]["full"] == "eventual reply"
 
 
 @pytest.mark.asyncio
@@ -200,7 +242,7 @@ async def test_connection_loss_unblocks_every_pending_request():
 
 
 @pytest.mark.asyncio
-async def test_resume_failure_clears_pointer_and_never_starts_on_same_process(tmp_path, monkeypatch):
+async def test_resume_transport_silence_preserves_pointer_and_uses_rollout(tmp_path, monkeypatch):
     server = object.__new__(codex_engine.CodexAppServer)
     ptr = tmp_path / "codex_last_thread"
     ptr.write_text("bad-thread", encoding="utf-8")
@@ -217,8 +259,7 @@ async def test_resume_failure_clears_pointer_and_never_starts_on_same_process(tm
     monkeypatch.setattr(server, "_request", failing_request)
     monkeypatch.setattr(server, "_start_fresh_thread", must_not_start_fresh)
 
-    with pytest.raises(RuntimeError, match="recycle required"):
-        await server._resolve_thread()
+    assert await server._resolve_thread() == "bad-thread"
 
     assert calls == [
         ("thread/resume", {
@@ -226,7 +267,46 @@ async def test_resume_failure_clears_pointer_and_never_starts_on_same_process(tm
             "config": codex_engine._reasoning_summary_config(),
         }, {"timeout": codex_engine.RESUME_TIMEOUT}),
     ]
+    assert ptr.read_text(encoding="utf-8") == "bad-thread"
+    assert server._rollout_only is True
+
+
+@pytest.mark.asyncio
+async def test_explicit_missing_thread_clears_pointer_and_recycles(tmp_path, monkeypatch):
+    server = object.__new__(codex_engine.CodexAppServer)
+    server._thread_id = "missing-thread"
+    ptr = tmp_path / "codex_last_thread"
+    ptr.write_text("missing-thread", encoding="utf-8")
+
+    async def missing_request(_method, _params, **_kwargs):
+        raise RuntimeError("thread/resume error: thread not found")
+
+    monkeypatch.setattr(codex_engine, "THREAD_PTR", str(ptr))
+    monkeypatch.setattr(server, "_request", missing_request)
+
+    with pytest.raises(RuntimeError, match="explicitly unavailable"):
+        await server._resolve_thread()
+
     assert not ptr.exists()
+    assert server._thread_id is None
+
+
+@pytest.mark.asyncio
+async def test_generic_resume_rpc_error_never_deletes_pointer(tmp_path, monkeypatch):
+    server = object.__new__(codex_engine.CodexAppServer)
+    ptr = tmp_path / "codex_last_thread"
+    ptr.write_text("existing-thread", encoding="utf-8")
+
+    async def invalid_request(_method, _params, **_kwargs):
+        raise RuntimeError("Invalid request: unsupported config field")
+
+    monkeypatch.setattr(codex_engine, "THREAD_PTR", str(ptr))
+    monkeypatch.setattr(server, "_request", invalid_request)
+
+    with pytest.raises(RuntimeError, match="unsupported config"):
+        await server._resolve_thread()
+
+    assert ptr.read_text(encoding="utf-8") == "existing-thread"
 
 
 @pytest.mark.asyncio

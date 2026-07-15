@@ -9,7 +9,8 @@ contract，上层按 `brain.target=="codex"` 显式路由。
 
 协议锚点见同目录 `README.md`(0.144.3 实测契约)。会话续接靠 thread 落盘 + 指针文件
 `state directory/codex_last_thread`:重启后 `thread/resume{threadId}`(不必同一 app-server 进程,
-从 CODEX_HOME 磁盘加载);读不到/resume 失败 → `thread/start` 新 thread 并回写指针。
+从 CODEX_HOME 磁盘加载);读不到或收到明确 thread 不存在错误 → `thread/start` 新 thread 并回写指针；
+transport 静默只降级观察 rollout，绝不据此清指针。
 
 shadow(Phase B):本模块**不接** relay backend dispatch。smoke:`python3 smoke_codex_engine.py`。
 """
@@ -42,11 +43,12 @@ THREAD_PTR = os.environ.get(
     "CODEX_THREAD_PTR", os.path.join(STATE_DIR, "codex_last_thread")
 )
 CODEX_MODEL = os.environ.get("CODEX_MODEL", "")
-TURN_TIMEOUT = float(os.environ.get("CODEX_TURN_TIMEOUT", "230"))
+TURN_TIMEOUT = float(os.environ.get("CODEX_TURN_TIMEOUT", "600"))
 REQ_TIMEOUT = float(os.environ.get("CODEX_REQ_TIMEOUT", "60"))
 RESUME_TIMEOUT = float(os.environ.get("CODEX_RESUME_TIMEOUT", "15"))
 TRANSCRIPT_POLL_SECONDS = float(os.environ.get("CODEX_TRANSCRIPT_POLL_SECONDS", "1"))
 ROLLOUT_START_TIMEOUT = float(os.environ.get("CODEX_ROLLOUT_START_TIMEOUT", "15"))
+HEARTBEAT_SECONDS = float(os.environ.get("CODEX_HEARTBEAT_SECONDS", "5"))
 CODEX_SESSIONS_DIR = os.environ.get(
     "CODEX_SESSIONS_DIR", os.path.expanduser("~/.codex/sessions")
 )
@@ -217,6 +219,22 @@ def _clear_thread_ptr(expected: Optional[str] = None) -> bool:
     except Exception:  # noqa: BLE001
         logger.exception("clear thread ptr failed")
         return False
+
+
+def _explicit_thread_unavailable(exc: BaseException) -> bool:
+    """Only explicit semantic thread failures may delete the durable pointer."""
+    message = str(exc).lower()
+    if "thread" not in message:
+        return False
+    return any(marker in message for marker in (
+        "not found",
+        "does not exist",
+        "unknown thread",
+        "invalid thread",
+        "thread unavailable",
+        "failed to load thread",
+        "corrupt",
+    ))
 
 
 # 当前 thread 是为哪个 brain epoch 建的(切换感知 · 无缝切 session)。
@@ -507,9 +525,9 @@ class CodexAppServer:
         return tid
 
     async def _resolve_thread(self) -> str:
-        """重启 / 冷起(非切换)→ resume 指针里的当前 thread;读不到 / resume 失败 → 起新。
+        """重启 / 冷起(非切换)→ resume 指针里的当前 thread；仅明确失效才起新。
 
-        resume 成功后继续沿用旧 thread；失败则清理坏指针并让外层回收 app-server。
+        resume 成功或仅 ack 静默都沿用旧 thread；只有明确 missing/corrupt 才清坏指针。
         起新 thread(冷启无历史):直接写入指针，后续由调用方按需注入 handoff。
         """
         ptr = _read_thread_ptr()
@@ -522,7 +540,13 @@ class CodexAppServer:
                 }, timeout=RESUME_TIMEOUT)
                 logger.info("codex thread resumed: %s", ptr)
                 return ptr
-            except RuntimeError:
+            except RuntimeError as exc:
+                if _explicit_thread_unavailable(exc):
+                    _clear_thread_ptr(ptr)
+                    self._thread_id = None
+                    raise RuntimeError(
+                        "codex thread explicitly unavailable; app-server recycle required"
+                    ) from exc
                 # 配置被未来 CLI 拒绝不等于 thread 失效；先用裸 resume 保住上下文。
                 logger.warning("thread/resume 摘要配置被拒(%s)→ 无摘要重试", ptr, exc_info=True)
                 try:
@@ -531,20 +555,32 @@ class CodexAppServer:
                     )
                     logger.warning("codex thread 已无摘要续接: %s", ptr)
                     return ptr
-                except Exception:  # noqa: BLE001
-                    logger.warning("thread/resume failed twice(%s)", ptr, exc_info=True)
+                except RuntimeError as bare_exc:
+                    if _explicit_thread_unavailable(bare_exc):
+                        _clear_thread_ptr(ptr)
+                        self._thread_id = None
+                        raise RuntimeError(
+                            "codex thread explicitly unavailable; app-server recycle required"
+                        ) from bare_exc
+                    logger.warning(
+                        "thread/resume failed without proof of thread loss(%s); preserving pointer",
+                        ptr, exc_info=True,
+                    )
+                    raise
+                except (asyncio.TimeoutError, ConnectionError, OSError):
+                    logger.warning(
+                        "bare thread/resume transport silent(%s); preserving pointer",
+                        ptr, exc_info=True,
+                    )
+                    self._rollout_only = True
+                    return ptr
             except (asyncio.TimeoutError, ConnectionError, OSError):
                 logger.warning(
-                    "thread/resume transport silent(%s); recycle without bare retry",
+                    "thread/resume transport silent(%s); preserving pointer and observing rollout",
                     ptr, exc_info=True,
                 )
-        # A failed resume can wedge this persistent stdio connection. Do not start
-        # a replacement thread here: the module-level caller must recycle the
-        # app-server first, then retry this silent turn exactly once.
-        if ptr:
-            _clear_thread_ptr(ptr)
-            self._thread_id = None
-            raise RuntimeError("codex thread resume failed; app-server recycle required")
+                self._rollout_only = True
+                return ptr
         tid = await self._start_fresh_thread()
         logger.info("codex thread started (no-switch): %s", tid)
         return tid
@@ -623,26 +659,23 @@ class CodexAppServer:
                     params["effort"] = effort
                 rollout_path, rollout_offset = _rollout_cursor(thread_id)
                 self._turn_request_sent = True
-                deferred_request_id: Optional[int] = None
-                deferred_request: Optional["asyncio.Future"] = None
-                rollout_only = bool(getattr(self, "_rollout_only", False))
-                if rollout_only:
-                    deferred_request_id, deferred_request = await self._begin_request(
-                        "turn/start", params,
-                    )
-                else:
-                    await self._request("turn/start", params)
-
-                deadline = asyncio.get_running_loop().time() + TURN_TIMEOUT
-                rollout_start_deadline = (
-                    asyncio.get_running_loop().time() + ROLLOUT_START_TIMEOUT
+                deferred_request_id, deferred_request = await self._begin_request(
+                    "turn/start", params,
                 )
+
+                loop = asyncio.get_running_loop()
+                turn_started_at = loop.time()
+                deadline = turn_started_at + TURN_TIMEOUT
+                rollout_start_deadline = turn_started_at + ROLLOUT_START_TIMEOUT
+                next_heartbeat = turn_started_at + HEARTBEAT_SECONDS
+                request_acknowledged = False
                 while True:
                     if deferred_request is not None and deferred_request.done():
                         response = deferred_request.result()
                         self._unwrap_response("turn/start", response)
                         deferred_request = None
-                    remaining = deadline - asyncio.get_running_loop().time()
+                        request_acknowledged = True
+                    remaining = deadline - loop.time()
                     if remaining <= 0:
                         raise asyncio.TimeoutError()
                     try:
@@ -656,13 +689,21 @@ class CodexAppServer:
                         )
                         if not salvaged:
                             if (
-                                rollout_only
-                                and asyncio.get_running_loop().time() >= rollout_start_deadline
+                                not request_acknowledged
+                                and loop.time() >= rollout_start_deadline
                                 and not _rollout_has_progress(rollout_path, rollout_offset)
                             ):
                                 raise ConnectionError(
-                                    "rollout-only turn/start produced no RPC ack or rollout progress"
+                                    "turn/start produced no RPC ack or rollout progress"
                                 )
+                            now = loop.time()
+                            if HEARTBEAT_SECONDS > 0 and now >= next_heartbeat:
+                                yield {"thinking_status": {
+                                    "verb": None,
+                                    "tokens": None,
+                                    "elapsed_s": max(1, int(now - turn_started_at)),
+                                }}
+                                next_heartbeat = now + HEARTBEAT_SECONDS
                             continue
 
                         full = salvaged["full"]
@@ -688,7 +729,7 @@ class CodexAppServer:
 
                         self._rollout_only = True
                         logger.warning(
-                            "codex stdio silent; entering rollout-only completion: %s",
+                            "codex RPC/notification silent; rollout completion recovered: %s",
                             thread_id,
                         )
                         yield {

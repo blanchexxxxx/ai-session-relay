@@ -7,7 +7,7 @@ It is intentionally only a local HTTP/NDJSON service. There is no web UI, databa
 ## What it keeps
 
 - Claude Code: persistent session pointer, safe resume fallback, transcript forge/trim, and empty-turn recovery.
-- Codex: persistent `app-server`, `thread/resume`, completed-rollout recovery, bad-thread cleanup, and no replay after a possibly-started turn.
+- Codex: persistent `app-server`, `thread/resume`, completed-rollout recovery, explicit bad-thread cleanup, and no replay after a possibly-started turn. Transport silence never deletes a durable thread pointer.
 - Engine switching: one local JSON state file with the active provider, a monotonic epoch, and a bounded recent handoff.
 - Streaming: the existing `delta`, activity, provider-specific thinking/usage, and final `done` NDJSON events.
 
@@ -85,9 +85,11 @@ No environment variables are required. Optional variables:
 | `AI_RELAY_HISTORY_MESSAGES` | `60` |
 | `AI_RELAY_HANDOFF_CHARS` | `24000` |
 | `CODEX_MODEL` | Codex CLI default |
+| `CODEX_TURN_TIMEOUT` | `600` seconds |
 | `CODEX_RESUME_TIMEOUT` | `15` seconds |
 | `CODEX_ROLLOUT_START_TIMEOUT` | `15` seconds without RPC ack or rollout progress |
 | `CODEX_TRANSCRIPT_POLL_SECONDS` | `1` second |
+| `CODEX_HEARTBEAT_SECONDS` | `5` seconds |
 
 Existing MCP configuration remains owned by each CLI; this relay does not require or rewrite it.
 
@@ -116,7 +118,7 @@ codex login
 ./install.sh codex 你的AI工作目录
 ```
 
-没有浏览器的 VPS 可以先运行 `codex login --device-auth`，在手机或电脑浏览器完成授权。relay 会保存 Codex thread id；服务重启后通过 `thread/resume` 接回去。坏 thread 或卡死的 app-server 会被自动丢弃并重建。
+没有浏览器的 VPS 可以先运行 `codex login --device-auth`，在手机或电脑浏览器完成授权。relay 会保存 Codex thread id；服务重启后通过 `thread/resume` 接回去。只有 app-server 明确报告 thread 不存在/损坏时才清理指针；单纯无回声会保留 thread 并从 rollout 收回完整回复。
 
 ### 3. 想在 Claude Code 和 Codex 之间无缝切换
 
