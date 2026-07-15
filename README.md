@@ -7,7 +7,7 @@ It is intentionally only a local HTTP/NDJSON service. There is no web UI, databa
 ## What it keeps
 
 - Claude Code: persistent session pointer, safe resume fallback, transcript forge/trim, and empty-turn recovery.
-- Codex: persistent `app-server`, `thread/resume`, completed-rollout recovery, explicit bad-thread cleanup, and no replay after a possibly-started turn. Transport silence never deletes a durable thread pointer.
+- Codex: persistent `app-server`, `thread/resume`, turn-id-correlated live/rollout recovery, explicit bad-thread cleanup, and one safe retry only after the old transport is dead and the rollout proves the turn never started. Transport silence never deletes a durable thread pointer.
 - Engine switching: one local JSON state file with the active provider, a monotonic epoch, and a bounded recent handoff.
 - Streaming: the existing `delta`, activity, provider-specific thinking/usage, and final `done` NDJSON events.
 
@@ -87,7 +87,7 @@ No environment variables are required. Optional variables:
 | `CODEX_MODEL` | Codex CLI default |
 | `CODEX_TURN_TIMEOUT` | `600` seconds |
 | `CODEX_RESUME_TIMEOUT` | `15` seconds |
-| `CODEX_ROLLOUT_START_TIMEOUT` | `15` seconds without RPC ack or rollout progress |
+| `CODEX_ROLLOUT_START_TIMEOUT` | `15` seconds without RPC ack, same-turn notification, or rollout progress before reconciled transport retry |
 | `CODEX_TRANSCRIPT_POLL_SECONDS` | `1` second |
 | `CODEX_HEARTBEAT_SECONDS` | `5` seconds |
 

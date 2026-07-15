@@ -22,6 +22,9 @@ import json
 import logging
 import os
 import sys
+import uuid
+from dataclasses import dataclass
+from enum import Enum
 from typing import Any, AsyncIterator, Optional
 
 _ENGINE_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -54,6 +57,30 @@ CODEX_SESSIONS_DIR = os.environ.get(
 )
 _ROLLOUT_PATH_CACHE: dict[str, str] = {}
 _ENGINE_RECOVERY_RETRIES = 1
+
+
+class _TurnPhase(str, Enum):
+    SENT_UNCONFIRMED = "sent_unconfirmed"
+    ACKNOWLEDGED = "acknowledged"
+    STARTED = "started"
+    COMPLETED = "completed"
+
+
+@dataclass(frozen=True)
+class _RolloutTurnState:
+    progressed: bool = False
+    turn_id: Optional[str] = None
+    completed: bool = False
+    full: str = ""
+    commentary_full: str = ""
+    codex_turn_usage: Optional[dict] = None
+
+
+class _TurnStartUnconfirmed(ConnectionError):
+    def __init__(self, path: Optional[str], offset: int) -> None:
+        super().__init__("turn/start produced no RPC ack or rollout progress")
+        self.rollout_path = path
+        self.rollout_offset = offset
 
 # 只请求**可展示的推理摘要**，不是原始私有推理。0.144.3 的 prolite 实测表明，必须在
 # thread start/resume 一并声明模型支持摘要；只在 turn/start 传 ``summary: auto`` 不会产生
@@ -123,20 +150,23 @@ def _rollout_has_progress(path: Optional[str], offset: int) -> bool:
         return False
 
 
-def _completed_turn_from_rollout(
+def _turn_state_from_rollout(
     path: Optional[str], offset: int,
-) -> Optional[dict[str, Any]]:
-    """Recover only a completed turn's public commentary, answer and usage."""
+) -> _RolloutTurnState:
+    """Read one serialized turn after a pre-send cursor from durable rollout."""
     if not path:
-        return None
+        return _RolloutTurnState()
     commentary: list[str] = []
     final_text: list[str] = []
     usage: Optional[dict] = None
+    progressed = False
+    turn_id: Optional[str] = None
     completed = False
     try:
         with open(path, "rb") as stream:
             stream.seek(max(0, offset))
             for raw_line in stream:
+                progressed = True
                 try:
                     obj = json.loads(raw_line.decode("utf-8"))
                 except (UnicodeDecodeError, json.JSONDecodeError):
@@ -144,10 +174,18 @@ def _completed_turn_from_rollout(
                 payload = obj.get("payload") or {}
                 if obj.get("type") == "event_msg":
                     event_type = payload.get("type")
-                    if event_type == "token_count" and isinstance(payload.get("info"), dict):
+                    event_turn_id = payload.get("turn_id")
+                    if event_type == "task_started":
+                        if turn_id is None and isinstance(event_turn_id, str):
+                            turn_id = event_turn_id
+                    elif event_type == "token_count" and isinstance(payload.get("info"), dict):
                         usage = _map_rollout_usage(payload["info"])
                     elif event_type == "task_complete":
-                        completed = True
+                        if turn_id is None and isinstance(event_turn_id, str):
+                            turn_id = event_turn_id
+                        if not event_turn_id or event_turn_id == turn_id:
+                            completed = True
+                            break
                     continue
                 if obj.get("type") != "response_item":
                     continue
@@ -167,15 +205,42 @@ def _completed_turn_from_rollout(
                 else:
                     final_text.append(text)
     except OSError:
+        return _RolloutTurnState()
+    return _RolloutTurnState(
+        progressed=progressed,
+        turn_id=turn_id,
+        completed=completed,
+        full="".join(final_text),
+        commentary_full="".join(commentary),
+        codex_turn_usage=usage,
+    )
+
+
+def _completed_turn_from_rollout(
+    path: Optional[str], offset: int,
+) -> Optional[dict[str, Any]]:
+    """Recover only a completed turn's public commentary, answer and usage."""
+    state = _turn_state_from_rollout(path, offset)
+    if not state.completed or not state.full:
         return None
-    full = "".join(final_text)
-    if not completed or not full:
-        return None
-    return {
-        "full": full,
-        "commentary_full": "".join(commentary),
-        "codex_turn_usage": usage,
+    recovered = {
+        "full": state.full,
+        "commentary_full": state.commentary_full,
+        "codex_turn_usage": state.codex_turn_usage,
     }
+    if state.turn_id:
+        recovered["turn_id"] = state.turn_id
+    return recovered
+
+
+def _notification_turn_id(obj: dict) -> Optional[str]:
+    params = obj.get("params") or {}
+    turn_id = params.get("turnId")
+    if isinstance(turn_id, str):
+        return turn_id
+    turn = params.get("turn") or {}
+    value = turn.get("id") if isinstance(turn, dict) else None
+    return value if isinstance(value, str) else None
 
 
 def _read_thread_ptr() -> Optional[str]:
@@ -334,7 +399,9 @@ class CodexAppServer:
         self._served_model = CODEX_MODEL or "default"
         self._rate_limited = False
         self._turn_request_sent = False
-        self._rollout_only = False
+        self._transport_desynced = False
+        self._resume_unconfirmed = False
+        self._last_turn_id: Optional[str] = None
         self._thread_id: Optional[str] = None   # 一个 engine 生命期一个活跃 thread(首轮 resolve)
 
     # ── 生命周期 ──────────────────────────────────────────────────────────
@@ -465,7 +532,7 @@ class CodexAppServer:
                 # 一律 approved(bypassPermissions 等价)· 否则工具调用挂死/被 cancel。
                 asyncio.create_task(self._auto_approve(obj))
             elif obj.get("method"):
-                if self._notif_q is not None and not self._rollout_only:
+                if self._notif_q is not None:
                     self._notif_q.put_nowait(obj)
 
     async def _drain_stderr(self) -> None:
@@ -572,14 +639,14 @@ class CodexAppServer:
                         "bare thread/resume transport silent(%s); preserving pointer",
                         ptr, exc_info=True,
                     )
-                    self._rollout_only = True
+                    self._resume_unconfirmed = True
                     return ptr
             except (asyncio.TimeoutError, ConnectionError, OSError):
                 logger.warning(
                     "thread/resume transport silent(%s); preserving pointer and observing rollout",
                     ptr, exc_info=True,
                 )
-                self._rollout_only = True
+                self._resume_unconfirmed = True
                 return ptr
         tid = await self._start_fresh_thread()
         logger.info("codex thread started (no-switch): %s", tid)
@@ -612,6 +679,7 @@ class CodexAppServer:
     async def stream_turn(
         self, text: str, *, model: Optional[str] = None, effort: Optional[str] = None,
         epoch: Optional[int] = None, handoff: Optional[str] = None,
+        client_message_id: Optional[str] = None,
     ) -> AsyncIterator[dict]:
         """驱动一轮 Codex · yield Codex 专属 thinking/usage 契约。
 
@@ -641,6 +709,7 @@ class CodexAppServer:
             usage: dict = _map_usage(None)
             self._rate_limited = False
             self._turn_request_sent = False
+            self._transport_desynced = False
 
             def record_activity(activity: Optional[dict]) -> Optional[dict]:
                 nonlocal activities
@@ -649,7 +718,9 @@ class CodexAppServer:
                 return activity
 
             try:
+                client_message_id = client_message_id or f"relay-{uuid.uuid4()}"
                 params: dict = {"threadId": thread_id,
+                                "clientUserMessageId": client_message_id,
                                 "input": [{"type": "text", "text": text}],
                                 # 与 thread 配置双保险：请求每轮都返回可展示的详细摘要。
                                 "summary": _REASONING_SUMMARY_MODE}
@@ -669,12 +740,22 @@ class CodexAppServer:
                 rollout_start_deadline = turn_started_at + ROLLOUT_START_TIMEOUT
                 next_heartbeat = turn_started_at + HEARTBEAT_SECONDS
                 request_acknowledged = False
+                saw_live_turn_event = False
+                active_turn_id: Optional[str] = None
+                phase = _TurnPhase.SENT_UNCONFIRMED
                 while True:
                     if deferred_request is not None and deferred_request.done():
                         response = deferred_request.result()
-                        self._unwrap_response("turn/start", response)
+                        result = self._unwrap_response("turn/start", response)
+                        acknowledged_turn_id = (result.get("turn") or {}).get("id")
+                        if isinstance(acknowledged_turn_id, str):
+                            if active_turn_id and active_turn_id != acknowledged_turn_id:
+                                raise RuntimeError("turn/start ack disagrees with rollout turn id")
+                            active_turn_id = acknowledged_turn_id
                         deferred_request = None
                         request_acknowledged = True
+                        if phase == _TurnPhase.SENT_UNCONFIRMED:
+                            phase = _TurnPhase.ACKNOWLEDGED
                     remaining = deadline - loop.time()
                     if remaining <= 0:
                         raise asyncio.TimeoutError()
@@ -684,18 +765,31 @@ class CodexAppServer:
                             timeout=min(max(0.1, TRANSCRIPT_POLL_SECONDS), remaining),
                         )
                     except asyncio.TimeoutError:
-                        salvaged = await asyncio.to_thread(
-                            _completed_turn_from_rollout, rollout_path, rollout_offset,
+                        rollout_state = await asyncio.to_thread(
+                            _turn_state_from_rollout, rollout_path, rollout_offset,
+                        )
+                        if rollout_state.turn_id:
+                            if active_turn_id and active_turn_id != rollout_state.turn_id:
+                                raise RuntimeError("rollout turn id changed within one serialized turn")
+                            active_turn_id = rollout_state.turn_id
+                        if rollout_state.progressed:
+                            phase = _TurnPhase.STARTED
+                        salvaged = (
+                            {
+                                "turn_id": rollout_state.turn_id,
+                                "full": rollout_state.full,
+                                "commentary_full": rollout_state.commentary_full,
+                                "codex_turn_usage": rollout_state.codex_turn_usage,
+                            }
+                            if rollout_state.completed and rollout_state.full
+                            else None
                         )
                         if not salvaged:
                             if (
-                                not request_acknowledged
+                                phase == _TurnPhase.SENT_UNCONFIRMED
                                 and loop.time() >= rollout_start_deadline
-                                and not _rollout_has_progress(rollout_path, rollout_offset)
                             ):
-                                raise ConnectionError(
-                                    "turn/start produced no RPC ack or rollout progress"
-                                )
+                                raise _TurnStartUnconfirmed(rollout_path, rollout_offset)
                             now = loop.time()
                             if HEARTBEAT_SECONDS > 0 and now >= next_heartbeat:
                                 yield {"thinking_status": {
@@ -727,10 +821,14 @@ class CodexAppServer:
                             text_parts.append(text_suffix)
                             yield {"delta": text_suffix}
 
-                        self._rollout_only = True
+                        phase = _TurnPhase.COMPLETED
+                        self._last_turn_id = active_turn_id
+                        self._transport_desynced = (
+                            not request_acknowledged and not saw_live_turn_event
+                        )
                         logger.warning(
-                            "codex RPC/notification silent; rollout completion recovered: %s",
-                            thread_id,
+                            "codex turn completed from rollout: thread=%s turn=%s transport_desynced=%s",
+                            thread_id, active_turn_id, self._transport_desynced,
                         )
                         yield {
                             "done": True,
@@ -749,6 +847,20 @@ class CodexAppServer:
                         return
                     m = obj.get("method") or ""
                     p = obj.get("params") or {}
+                    event_turn_id = _notification_turn_id(obj)
+                    if event_turn_id:
+                        if (
+                            event_turn_id == getattr(self, "_last_turn_id", None)
+                            and active_turn_id is None
+                        ):
+                            continue
+                        if active_turn_id and event_turn_id != active_turn_id:
+                            continue
+                        if active_turn_id is None:
+                            active_turn_id = event_turn_id
+                        saw_live_turn_event = True
+                        if phase == _TurnPhase.SENT_UNCONFIRMED:
+                            phase = _TurnPhase.STARTED
                     if m == "item/started":
                         it = p.get("item") or {}
                         item_id = it.get("id")
@@ -834,6 +946,8 @@ class CodexAppServer:
                         if isinstance(rl.get("usedPercent"), (int, float)) and rl["usedPercent"] >= 100:
                             self._rate_limited = True
                     elif m == "turn/failed":
+                        phase = _TurnPhase.COMPLETED
+                        self._last_turn_id = active_turn_id
                         full = "".join(text_parts)
                         yield {"done": True, "full": full,
                                "parts": [{"type": "text", "text": full}] if full else [],
@@ -846,6 +960,8 @@ class CodexAppServer:
                                "rate_limited": self._rate_limited, "error": "turn_failed"}
                         return
                     elif m == "turn/completed":
+                        phase = _TurnPhase.COMPLETED
+                        self._last_turn_id = active_turn_id
                         break
 
                 full = "".join(text_parts)
@@ -899,23 +1015,40 @@ async def stream_codex_turn(
     text: str, *, model: Optional[str] = None, effort: Optional[str] = None,
     epoch: Optional[int] = None, handoff: Optional[str] = None,
 ) -> AsyncIterator[dict]:
-    """Recover one silent failed turn without replaying visible work or tool calls."""
+    """Recover an unconfirmed send after transport death and rollout reconciliation."""
+    client_message_id = f"relay-{uuid.uuid4()}"
     for attempt in range(_ENGINE_RECOVERY_RETRIES + 1):
         eng = await get_engine()
         emitted = False
+        emitted_payload = False
         try:
             async for ev in eng.stream_turn(
                 text, model=model, effort=effort, epoch=epoch, handoff=handoff,
+                client_message_id=client_message_id,
             ):
                 emitted = True
+                if "thinking_status" not in ev:
+                    emitted_payload = True
                 yield ev
+            if getattr(eng, "_transport_desynced", False):
+                await _discard_engine(eng)
             return
-        except (asyncio.TimeoutError, ConnectionError, OSError, RuntimeError):
+        except (asyncio.TimeoutError, ConnectionError, OSError, RuntimeError) as exc:
             logger.warning("codex turn failed (attempt=%d emitted=%s); recycle engine",
                            attempt + 1, emitted, exc_info=True)
             turn_request_sent = bool(getattr(eng, "_turn_request_sent", False))
             await _discard_engine(eng)
-            if not emitted and not turn_request_sent and attempt < _ENGINE_RECOVERY_RETRIES:
+            if isinstance(exc, _TurnStartUnconfirmed) and attempt < _ENGINE_RECOVERY_RETRIES:
+                if not _rollout_has_progress(exc.rollout_path, exc.rollout_offset):
+                    logger.warning(
+                        "retrying reconciled unconfirmed turn on a fresh app-server"
+                    )
+                    continue
+                logger.error("rollout advanced during recycle; refusing ambiguous replay")
+            if (
+                not emitted_payload and not turn_request_sent
+                and attempt < _ENGINE_RECOVERY_RETRIES
+            ):
                 logger.info("retrying silent codex turn once on a fresh app-server")
                 continue
             raise

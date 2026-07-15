@@ -83,7 +83,6 @@ async def test_fresh_engine_turn_completes_without_waiting_for_rpc_ack(monkeypat
     server._notif_q = None
     server._rate_limited = False
     server._served_model = "default"
-    server._rollout_only = False
     server._pending = {}
 
     async def begin_request(_method, _params):
@@ -91,19 +90,21 @@ async def test_fresh_engine_turn_completes_without_waiting_for_rpc_ack(monkeypat
         server._pending[9] = future
         return 9, future
 
-    recovered = iter([None, {
-        "full": "fast reply",
-        "commentary_full": "",
-        "codex_turn_usage": {
+    recovered = iter([
+        codex_engine._RolloutTurnState(),
+        codex_engine._RolloutTurnState(
+            progressed=True, turn_id="turn-fast", completed=True,
+            full="fast reply", commentary_full="", codex_turn_usage={
             "input_tokens": 10, "cached_input_tokens": 2,
             "output_tokens": 5, "reasoning_output_tokens": 1,
             "total_tokens": 15, "model_context_window": 258400,
-        },
-    }])
+            },
+        ),
+    ])
     monkeypatch.setattr(server, "_begin_request", begin_request)
     monkeypatch.setattr(codex_engine, "_rollout_cursor", lambda _tid: ("rollout", 10))
     monkeypatch.setattr(
-        codex_engine, "_completed_turn_from_rollout", lambda _path, _offset: next(recovered),
+        codex_engine, "_turn_state_from_rollout", lambda _path, _offset: next(recovered),
     )
     monkeypatch.setattr(codex_engine, "_rollout_has_progress", lambda _path, _offset: True)
     monkeypatch.setattr(codex_engine, "TRANSCRIPT_POLL_SECONDS", 0.001)
@@ -123,7 +124,6 @@ async def test_any_turn_surfaces_explicit_rpc_error(monkeypatch):
     server._notif_q = None
     server._rate_limited = False
     server._served_model = "default"
-    server._rollout_only = False
     server._pending = {}
 
     async def begin_request(_method, _params):
@@ -148,7 +148,6 @@ async def test_any_turn_fails_fast_without_ack_or_progress(monkeypatch):
     server._notif_q = None
     server._rate_limited = False
     server._served_model = "default"
-    server._rollout_only = False
     server._pending = {}
 
     async def begin_request(_method, _params):
@@ -158,7 +157,10 @@ async def test_any_turn_fails_fast_without_ack_or_progress(monkeypatch):
 
     monkeypatch.setattr(server, "_begin_request", begin_request)
     monkeypatch.setattr(codex_engine, "_rollout_cursor", lambda _tid: ("rollout", 10))
-    monkeypatch.setattr(codex_engine, "_completed_turn_from_rollout", lambda _p, _o: None)
+    monkeypatch.setattr(
+        codex_engine, "_turn_state_from_rollout",
+        lambda _p, _o: codex_engine._RolloutTurnState(),
+    )
     monkeypatch.setattr(codex_engine, "_rollout_has_progress", lambda _p, _o: False)
     monkeypatch.setattr(codex_engine, "TRANSCRIPT_POLL_SECONDS", 0.001)
     monkeypatch.setattr(codex_engine, "ROLLOUT_START_TIMEOUT", 0.002)
@@ -176,7 +178,6 @@ async def test_long_silent_turn_emits_keepalive_until_rollout_completes(monkeypa
     server._notif_q = None
     server._rate_limited = False
     server._served_model = "default"
-    server._rollout_only = False
     server._pending = {}
 
     async def begin_request(_method, _params):
@@ -190,16 +191,18 @@ async def test_long_silent_turn_emits_keepalive_until_rollout_completes(monkeypa
         nonlocal polls
         polls += 1
         if polls < 5:
-            return None
-        return {
-            "full": "eventual reply",
-            "commentary_full": "",
-            "codex_turn_usage": codex_engine._map_usage(None),
-        }
+            return codex_engine._RolloutTurnState(
+                progressed=True, turn_id="turn-eventual",
+            )
+        return codex_engine._RolloutTurnState(
+            progressed=True, turn_id="turn-eventual", completed=True,
+            full="eventual reply", commentary_full="",
+            codex_turn_usage=codex_engine._map_usage(None),
+        )
 
     monkeypatch.setattr(server, "_begin_request", begin_request)
     monkeypatch.setattr(codex_engine, "_rollout_cursor", lambda _tid: ("rollout", 10))
-    monkeypatch.setattr(codex_engine, "_completed_turn_from_rollout", completed)
+    monkeypatch.setattr(codex_engine, "_turn_state_from_rollout", completed)
     monkeypatch.setattr(codex_engine, "_rollout_has_progress", lambda _p, _o: True)
     monkeypatch.setattr(codex_engine, "TRANSCRIPT_POLL_SECONDS", 0.001)
     monkeypatch.setattr(codex_engine, "HEARTBEAT_SECONDS", 0.002)
@@ -268,7 +271,7 @@ async def test_resume_transport_silence_preserves_pointer_and_uses_rollout(tmp_p
         }, {"timeout": codex_engine.RESUME_TIMEOUT}),
     ]
     assert ptr.read_text(encoding="utf-8") == "bad-thread"
-    assert server._rollout_only is True
+    assert server._resume_unconfirmed is True
 
 
 @pytest.mark.asyncio
@@ -412,6 +415,44 @@ async def test_visible_failure_recycles_but_never_replays_turn(monkeypatch):
     assert get_calls == 1
     assert broken.calls == 1
     assert discarded == [broken]
+
+
+@pytest.mark.asyncio
+async def test_unconfirmed_send_retries_after_dead_transport_and_unchanged_rollout(monkeypatch):
+    calls = []
+
+    class Unconfirmed:
+        _turn_request_sent = True
+
+        async def stream_turn(self, *_args, **kwargs):
+            calls.append(kwargs["client_message_id"])
+            yield {"thinking_status": {"verb": None, "tokens": None, "elapsed_s": 5}}
+            raise codex_engine._TurnStartUnconfirmed("rollout", 10)
+
+    class Working:
+        _turn_request_sent = False
+        _transport_desynced = False
+
+        async def stream_turn(self, *_args, **kwargs):
+            calls.append(kwargs["client_message_id"])
+            yield {"delta": "recovered"}
+
+    engines = [Unconfirmed(), Working()]
+
+    async def fake_get_engine():
+        return engines.pop(0)
+
+    async def fake_discard(_engine):
+        return None
+
+    monkeypatch.setattr(codex_engine, "get_engine", fake_get_engine)
+    monkeypatch.setattr(codex_engine, "_discard_engine", fake_discard)
+    monkeypatch.setattr(codex_engine, "_rollout_has_progress", lambda _p, _o: False)
+
+    events = await _collect(codex_engine.stream_codex_turn("hello"))
+
+    assert events[-1] == {"delta": "recovered"}
+    assert calls[0] == calls[1]
 
 
 @pytest.mark.asyncio
