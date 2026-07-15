@@ -92,19 +92,20 @@
 - shape 发错会被服务端视为拒绝或一直挂起。
 - 当前项目是 trusted-local autonomous 模式，`approvalPolicy=never` 并自动批准。若改安全模型，需要同时设计远端审批协议，不能只关 `_auto_approve`，否则工具 turn 会无期限等待。
 
-### resume 失败后不要在同一 stdio 连接继续 thread/start
+### resume 没回声不等于 thread 失效
 
 - 已捕获失败链：`thread/resume` timeout/failure 后，同一持久 app-server 上紧接 `thread/start` 也 timeout。
-- 这不是普通“坏 thread”单点问题；失败请求可能已污染连接/reader/pending 状态。
-- 正确恢复：条件清理坏 pointer → close/kill 当前 app-server → 新建连接并重新 initialize → silent turn 重试一次。
-- transport timeout/EOF 不是“摘要配置 schema 被拒”。前者只等一次有界 `CODEX_RESUME_TIMEOUT` 后回收；只有收到明确 RPC error 时，才允许去掉可选 config 裸 resume 一次。
+- rollout 文件可能仍完好、持续增长并包含完整 final answer；timeout/EOF 只证明 response 通道静默，不能证明持久 thread 坏了。
+- 正确恢复：保留 pointer，进入 rollout observation；JSON-RPC 在同一 stdio 上有序，resume 可能已被接受，只是 ack 丢失。
+- 只有明确包含 thread missing/unknown/corrupt 语义的 RPC error 才能条件清理 pointer，再回收 app-server 并新建 thread。普通 schema error 只允许去掉可选 config 裸 resume 一次。
 
 ### rollout 完成不代表 RPC response 通道健康
 
 - Codex app-server 可能已经接收并完成 `turn/start`、把 `task_complete` 写入 rollout，却漏掉对应 RPC ack 和 turn notifications。
 - 每轮发送前记录该 thread rollout 的 byte offset；live queue 静默时只读 offset 后的新记录。必须同时看到 `task_complete` 和 final `output_text` 才能收口，且绝不读取 raw/encrypted reasoning。
-- 一次完成态回收后进入 rollout-only：后续 `turn/start` 只发送一次，立刻观察 rollout，不先白等通用 RPC timeout。明确 RPC error 仍立即失败；既无 ack 又无 rollout 新字节满 `CODEX_ROLLOUT_START_TIMEOUT` 才回收。
-- rollout-only 的未决 response future 在成功、异常和取消路径都必须清理，避免迟到 response 污染下一轮。
+- 所有模式（包括 fresh app-server 首轮）的 `turn/start` 都只发送一次并立刻观察 rollout，不能让首轮先白等通用 RPC timeout。明确 RPC error 仍立即失败；既无 ack 又无 rollout 新字节满 `CODEX_ROLLOUT_START_TIMEOUT` 才判 transport 无进展。
+- 未决 response future 在成功、异常和取消路径都必须清理，避免迟到 response 污染下一轮。
+- 长轮等待期间按 `CODEX_HEARTBEAT_SECONDS` 发轻量 keepalive；这不是 reasoning/CoT，只用于维持上游流连接和报告 elapsed time。
 
 ### 清坏指针必须防竞态
 
