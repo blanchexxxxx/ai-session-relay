@@ -90,7 +90,21 @@
 - exec/command/patch/file-change 请求使用 `{"decision":"approved"}`。
 - `mcpServer/elicitation/request` 使用 `{"action":"accept","content":{}}`。
 - shape 发错会被服务端视为拒绝或一直挂起。
-- 当前项目是 trusted-local autonomous 模式，`approvalPolicy=never` 并自动批准。若改安全模型，需要同时设计远端审批协议，不能只关 `_auto_approve`，否则工具 turn 会无期限等待。
+- 当前项目是 trusted-local autonomous 模式，`thread/start` 与**每个** `turn/start` 都显式传
+  `approvalPolicy=never` 并自动批准。不能假设 thread policy 会被 resume 后的 turn 永久继承。若改安全模型，
+  需要同时设计远端审批协议，不能只关 `_auto_approve`，否则工具 turn 会无期限等待。
+
+### 上下文续航必须在两轮之间预换 thread
+
+- 不调用原生 compact。每轮开始前扫描当前 thread rollout：任何顶层 `type="compacted"` 都要求换窗；否则
+  使用最后一个**完成 turn** 的 `last_token_usage.total_tokens` 与 `model_context_window`。
+- 阈值为 `min(window × 75%, window - 60k, 250k)`。250k 是 relay 的成本/延迟上限，不是伪造模型窗口。
+  UI 仍展示单轮 last usage；session 决策使用“下一轮要承载的既有上下文”口径，二者不可混用。
+- 顺序必须是：本地 `_start_fresh_thread(persist=false)`（即 RPC 建 thread、暂不提交 pointer）→ 注入必需
+  handoff → 原子写 pointer → 更新内存 thread id。
+  handoff 缺失、新建/注入/写指针失败都继续旧 thread。旧 rollout 永不移动或删除。
+- 只允许在没有 inflight turn 时换窗；provider epoch 切换优先。冷启动指针已经过肥时，必须先 rotate，
+  不能先付一次昂贵 `thread/resume` 再换。
 
 ### resume 没回声不等于 thread 失效，也不等于通知流永久失效
 
@@ -107,6 +121,8 @@
 - 未决 response future 在成功、异常和取消路径都必须清理，避免迟到 response 污染下一轮。
 - 长轮等待期间按 `CODEX_HEARTBEAT_SECONDS` 发轻量 keepalive；这不是 reasoning/CoT，只用于维持上游流连接和报告 elapsed time。
 - RPC response、notification 与 rollout 必须按同一个 turn id 对齐。迟到的旧 turn 事件按 id 丢弃，不能靠全局关闭通知流防串流。
+- 仅靠 rollout 完整收口不等于 app-server 必须回收。保持暖进程，下一轮重新启用 live notification、RPC 与
+  rollout 三路竞速；否则会形成“每轮冷启动 → 慢 resume → rollout 收口 → 再丢进程”的永久延迟循环。
 
 ### 清坏指针必须防竞态
 
@@ -137,6 +153,8 @@
 
 - `_turn_lock` 与单 `_notif_q` 是配套设计。去掉锁后两个 turn 的 notification 会串流。
 - 若要并发，必须一用户/一 thread 建独立连接或实现按 turn/thread id 完整路由，不能共享当前单 queue。
+- POSIX 上 Node launcher 与 native Codex 必须处于同一新进程组，关闭时向整个进程组发 TERM/KILL；只杀
+  launcher 会留下持有 pipe/文件的 native 子进程，让下一次连接出现幽灵 response 或资源泄漏。
 
 ## Claude ↔ Codex switching
 

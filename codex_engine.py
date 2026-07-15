@@ -21,6 +21,7 @@ import glob
 import json
 import logging
 import os
+import signal
 import sys
 import uuid
 from dataclasses import dataclass
@@ -55,8 +56,13 @@ HEARTBEAT_SECONDS = float(os.environ.get("CODEX_HEARTBEAT_SECONDS", "5"))
 CODEX_SESSIONS_DIR = os.environ.get(
     "CODEX_SESSIONS_DIR", os.path.expanduser("~/.codex/sessions")
 )
+_CONTINUATION_TRIGGER_RATIO = 0.75
+_CONTINUATION_HEADROOM_TOKENS = 60_000
+_CONTINUATION_TRIGGER_CAP = 250_000
 _ROLLOUT_PATH_CACHE: dict[str, str] = {}
 _ENGINE_RECOVERY_RETRIES = 1
+_USE_POSIX_PROCESS_GROUP = os.name == "posix"
+_POSIX_KILL_SIGNAL = getattr(signal, "SIGKILL", signal.SIGTERM)
 
 
 class _TurnPhase(str, Enum):
@@ -76,11 +82,41 @@ class _RolloutTurnState:
     codex_turn_usage: Optional[dict] = None
 
 
+@dataclass(frozen=True)
+class _RolloutContinuationState:
+    last_completed_usage: Optional[dict] = None
+    thread_compacted: bool = False
+    latest_turn_completed: bool = False
+
+
 class _TurnStartUnconfirmed(ConnectionError):
     def __init__(self, path: Optional[str], offset: int) -> None:
         super().__init__("turn/start produced no RPC ack or rollout progress")
         self.rollout_path = path
         self.rollout_offset = offset
+
+
+def _app_server_process_kwargs() -> dict:
+    if _USE_POSIX_PROCESS_GROUP:
+        return {"start_new_session": True}
+    return {}
+
+
+def _kill_app_server_process(proc: asyncio.subprocess.Process) -> None:
+    if proc.returncode is not None:
+        return
+    if _USE_POSIX_PROCESS_GROUP:
+        try:
+            os.killpg(proc.pid, _POSIX_KILL_SIGNAL)
+            return
+        except ProcessLookupError:
+            return
+        except OSError:
+            logger.warning(
+                "codex app-server process-group kill failed; falling back to launcher",
+                exc_info=True,
+            )
+    proc.kill()
 
 # 只请求**可展示的推理摘要**，不是原始私有推理。0.144.3 的 prolite 实测表明，必须在
 # thread start/resume 一并声明模型支持摘要；只在 turn/start 传 ``summary: auto`` 不会产生
@@ -233,6 +269,77 @@ def _completed_turn_from_rollout(
     return recovered
 
 
+def _rollout_continuation_state(thread_id: str) -> _RolloutContinuationState:
+    """Return completed usage plus any native-compaction evidence for a thread."""
+    path = _find_rollout_path(thread_id)
+    if not path:
+        return _RolloutContinuationState()
+    completed_usage: Optional[dict] = None
+    active_usage: Optional[dict] = None
+    thread_compacted = False
+    active_started = False
+    latest_turn_completed = False
+    try:
+        with open(path, "rb") as f:
+            for raw_line in f:
+                try:
+                    obj = json.loads(raw_line.decode("utf-8"))
+                except (UnicodeDecodeError, json.JSONDecodeError):
+                    continue
+                payload = obj.get("payload") or {}
+                if obj.get("type") == "event_msg":
+                    event_type = payload.get("type")
+                    if event_type == "task_started":
+                        active_started = True
+                        active_usage = None
+                        latest_turn_completed = False
+                    elif event_type == "token_count" and active_started:
+                        info = payload.get("info")
+                        if isinstance(info, dict):
+                            active_usage = _map_rollout_usage(info)
+                    elif event_type == "task_complete" and active_started:
+                        if active_usage is not None:
+                            completed_usage = active_usage
+                        latest_turn_completed = True
+                    continue
+                if obj.get("type") == "compacted":
+                    thread_compacted = True
+    except OSError:
+        return _RolloutContinuationState()
+    return _RolloutContinuationState(
+        last_completed_usage=completed_usage,
+        thread_compacted=thread_compacted,
+        latest_turn_completed=latest_turn_completed,
+    )
+
+
+def _continuation_trigger_tokens(model_context_window: int) -> int:
+    window = max(1, int(model_context_window))
+    return max(1, min(
+        int(window * _CONTINUATION_TRIGGER_RATIO),
+        window - _CONTINUATION_HEADROOM_TOKENS,
+        _CONTINUATION_TRIGGER_CAP,
+    ))
+
+
+def _continuation_rotation_reason(
+    state: _RolloutContinuationState,
+) -> Optional[str]:
+    if state.thread_compacted:
+        return "native_compact"
+    usage = state.last_completed_usage or {}
+    window = usage.get("model_context_window")
+    total_tokens = usage.get("total_tokens")
+    if not isinstance(window, (int, float)) or window <= 0:
+        return None
+    if not isinstance(total_tokens, (int, float)) or total_tokens <= 0:
+        return None
+    trigger = _continuation_trigger_tokens(int(window))
+    if int(total_tokens) >= trigger:
+        return f"context_pressure:{int(total_tokens)}>={trigger}/{int(window)}"
+    return None
+
+
 def _notification_turn_id(obj: dict) -> Optional[str]:
     params = obj.get("params") or {}
     turn_id = params.get("turnId")
@@ -255,7 +362,7 @@ def _read_thread_ptr() -> Optional[str]:
         return None
 
 
-def _write_thread_ptr(thread_id: str) -> None:
+def _write_thread_ptr(thread_id: str) -> bool:
     try:
         os.makedirs(os.path.dirname(THREAD_PTR), exist_ok=True)
         tmp = THREAD_PTR + ".tmp"
@@ -264,8 +371,10 @@ def _write_thread_ptr(thread_id: str) -> None:
             f.flush()
             os.fsync(f.fileno())
         os.replace(tmp, THREAD_PTR)
+        return True
     except Exception:  # noqa: BLE001
         logger.exception("write thread ptr failed")
+        return False
 
 
 def _clear_thread_ptr(expected: Optional[str] = None) -> bool:
@@ -411,6 +520,7 @@ class CodexAppServer:
             stdin=asyncio.subprocess.PIPE,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
+            **_app_server_process_kwargs(),
         )
         self._reader = asyncio.create_task(self._read_loop())
         self._stderr = asyncio.create_task(self._drain_stderr())
@@ -443,7 +553,7 @@ class CodexAppServer:
         if proc:
             try:
                 if proc.returncode is None:
-                    proc.kill()
+                    _kill_app_server_process(proc)
                 await asyncio.wait_for(proc.wait(), timeout=5)
             except asyncio.TimeoutError:
                 logger.warning("codex app-server did not exit after kill")
@@ -566,8 +676,29 @@ class CodexAppServer:
         except Exception:  # noqa: BLE001
             logger.exception("auto-approve failed: %s", method)
 
+    async def _inject_handoff(
+        self, thread_id: str, handoff: Optional[str], *, required: bool = False,
+    ) -> bool:
+        if not handoff:
+            return False
+        try:
+            await self._request("thread/inject_items", {
+                "threadId": thread_id,
+                "items": [{
+                    "type": "message", "role": "developer",
+                    "content": [{"type": "input_text", "text": handoff}],
+                }],
+            })
+            logger.info("codex handoff injected (%d chars) → %s", len(handoff), thread_id)
+            return True
+        except Exception:  # noqa: BLE001
+            if required:
+                raise
+            logger.exception("handoff inject failed; fresh thread remains usable")
+            return False
+
     # ── thread 续接 / 空窗口接班 ──────────────────────────────────────────
-    async def _start_fresh_thread(self) -> str:
+    async def _start_fresh_thread(self, *, persist: bool = True) -> str:
         """thread/start 一个干净新 thread(空窗口)· 写指针 · 返回 id。
 
         approvalPolicy=never:agent自主用工具不弹审批 = Claude bypassPermissions 等价;
@@ -588,10 +719,46 @@ class CodexAppServer:
         tid = (res.get("thread") or {}).get("id")
         if not tid:
             raise RuntimeError("thread/start 没拿到 thread.id")
-        _write_thread_ptr(tid)
+        if persist and not _write_thread_ptr(tid):
+            raise OSError("failed to persist fresh codex thread pointer")
         return tid
 
-    async def _resolve_thread(self) -> str:
+    async def _rotate_for_continuation(
+        self, old_thread_id: str, handoff: Optional[str], reason: str,
+    ) -> str:
+        if not handoff:
+            logger.warning(
+                "codex continuation rotation deferred(no handoff): thread=%s reason=%s",
+                old_thread_id, reason,
+            )
+            return old_thread_id
+        try:
+            new_thread_id = await self._start_fresh_thread(persist=False)
+            await self._inject_handoff(new_thread_id, handoff, required=True)
+            if not _write_thread_ptr(new_thread_id):
+                raise OSError("failed to commit codex continuation pointer")
+            logger.warning(
+                "codex continuation rotated: old=%s new=%s reason=%s",
+                old_thread_id, new_thread_id, reason,
+            )
+            return new_thread_id
+        except Exception:  # noqa: BLE001
+            logger.exception(
+                "codex continuation rotation failed; keeping old thread=%s reason=%s",
+                old_thread_id, reason,
+            )
+            return old_thread_id
+
+    async def _maybe_rotate_for_continuation(
+        self, thread_id: str, handoff: Optional[str],
+    ) -> str:
+        state = await asyncio.to_thread(_rollout_continuation_state, thread_id)
+        reason = _continuation_rotation_reason(state)
+        if not reason:
+            return thread_id
+        return await self._rotate_for_continuation(thread_id, handoff, reason)
+
+    async def _resolve_thread(self, handoff: Optional[str] = None) -> str:
         """重启 / 冷起(非切换)→ resume 指针里的当前 thread；仅明确失效才起新。
 
         resume 成功或仅 ack 静默都沿用旧 thread；只有明确 missing/corrupt 才清坏指针。
@@ -649,6 +816,7 @@ class CodexAppServer:
                 self._resume_unconfirmed = True
                 return ptr
         tid = await self._start_fresh_thread()
+        await self._inject_handoff(tid, handoff)
         logger.info("codex thread started (no-switch): %s", tid)
         return tid
 
@@ -660,18 +828,7 @@ class CodexAppServer:
         下一句真消息才 turn/start —— 那时agent已"知道刚才发生了什么",无缝接上。
         """
         tid = await self._start_fresh_thread()
-        if handoff:
-            try:
-                await self._request("thread/inject_items", {
-                    "threadId": tid,
-                    "items": [{
-                        "type": "message", "role": "developer",
-                        "content": [{"type": "input_text", "text": handoff}],
-                    }],
-                })
-                logger.info("codex handoff injected (%d 字) → fresh thread %s", len(handoff), tid)
-            except Exception:  # noqa: BLE001 · 注入失败 thread 仍可用(只是没近场上下文)
-                logger.exception("handoff inject failed(fresh thread 仍可用)")
+        await self._inject_handoff(tid, handoff)
         logger.info("codex NEW session (switch): %s", tid)
         return tid
 
@@ -691,7 +848,21 @@ class CodexAppServer:
                 self._thread_id = await self._new_session(handoff)
                 _write_thread_epoch(epoch)
             elif self._thread_id is None:
-                self._thread_id = await self._resolve_thread()
+                persisted = _read_thread_ptr()
+                if persisted:
+                    candidate = await self._maybe_rotate_for_continuation(
+                        persisted, handoff,
+                    )
+                    if candidate != persisted:
+                        self._thread_id = candidate
+                    else:
+                        self._thread_id = await self._resolve_thread(handoff)
+                else:
+                    self._thread_id = await self._resolve_thread(handoff)
+            else:
+                self._thread_id = await self._maybe_rotate_for_continuation(
+                    self._thread_id, handoff,
+                )
             thread_id = self._thread_id
             self._served_model = model or CODEX_MODEL or "default"
             q: "asyncio.Queue" = asyncio.Queue()
@@ -722,6 +893,7 @@ class CodexAppServer:
                 params: dict = {"threadId": thread_id,
                                 "clientUserMessageId": client_message_id,
                                 "input": [{"type": "text", "text": text}],
+                                "approvalPolicy": "never",
                                 # 与 thread 配置双保险：请求每轮都返回可展示的详细摘要。
                                 "summary": _REASONING_SUMMARY_MODE}
                 if model or CODEX_MODEL:
@@ -1031,7 +1203,9 @@ async def stream_codex_turn(
                     emitted_payload = True
                 yield ev
             if getattr(eng, "_transport_desynced", False):
-                await _discard_engine(eng)
+                logger.warning(
+                    "codex transport silent but rollout completed; keeping app-server warm"
+                )
             return
         except (asyncio.TimeoutError, ConnectionError, OSError, RuntimeError) as exc:
             logger.warning("codex turn failed (attempt=%d emitted=%s); recycle engine",

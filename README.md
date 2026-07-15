@@ -7,7 +7,7 @@ It is intentionally only a local HTTP/NDJSON service. There is no web UI, databa
 ## What it keeps
 
 - Claude Code: persistent session pointer, safe resume fallback, transcript forge/trim, and empty-turn recovery.
-- Codex: persistent `app-server`, `thread/resume`, turn-id-correlated live/rollout recovery, explicit bad-thread cleanup, and one safe retry only after the old transport is dead and the rollout proves the turn never started. Transport silence never deletes a durable thread pointer.
+- Codex: persistent `app-server`, model-aware between-turn pre-rotation, atomic handoff/pointer commit, `thread/resume`, turn-id-correlated live/rollout recovery, and one safe retry only after the old transport is dead and the rollout proves the turn never started. Transport silence never deletes a durable thread pointer.
 - Engine switching: one local JSON state file with the active provider, a monotonic epoch, and a bounded recent handoff.
 - Streaming: the existing `delta`, activity, provider-specific thinking/usage, and final `done` NDJSON events.
 
@@ -118,7 +118,7 @@ codex login
 ./install.sh codex 你的AI工作目录
 ```
 
-没有浏览器的 VPS 可以先运行 `codex login --device-auth`，在手机或电脑浏览器完成授权。relay 会保存 Codex thread id；服务重启后通过 `thread/resume` 接回去。只有 app-server 明确报告 thread 不存在/损坏时才清理指针；单纯无回声会保留 thread 并从 rollout 收回完整回复。
+没有浏览器的 VPS 可以先运行 `codex login --device-auth`，在手机或电脑浏览器完成授权。relay 会保存 Codex thread id；服务重启后通过 `thread/resume` 接回去。只有 app-server 明确报告 thread 不存在/损坏时才清理指针；单纯无回声会保留 thread 并从 rollout 收回完整回复。每轮开始前还会读取旧 thread 的完成态 token usage：接近模型窗口或已经发生原生 compact 时，先向新 thread 注入有界 handoff，再原子切换指针；失败继续旧 thread，旧 rollout 不删除。
 
 ### 3. 想在 Claude Code 和 Codex 之间无缝切换
 
