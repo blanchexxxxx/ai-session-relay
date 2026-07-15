@@ -16,11 +16,12 @@ shadow(Phase B):本模块**不接** relay backend dispatch。smoke:`python3 smok
 from __future__ import annotations
 
 import asyncio
+import glob
 import json
 import logging
 import os
 import sys
-from typing import AsyncIterator, Optional
+from typing import Any, AsyncIterator, Optional
 
 _ENGINE_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if _ENGINE_ROOT not in sys.path:
@@ -43,6 +44,13 @@ THREAD_PTR = os.environ.get(
 CODEX_MODEL = os.environ.get("CODEX_MODEL", "")
 TURN_TIMEOUT = float(os.environ.get("CODEX_TURN_TIMEOUT", "230"))
 REQ_TIMEOUT = float(os.environ.get("CODEX_REQ_TIMEOUT", "60"))
+RESUME_TIMEOUT = float(os.environ.get("CODEX_RESUME_TIMEOUT", "15"))
+TRANSCRIPT_POLL_SECONDS = float(os.environ.get("CODEX_TRANSCRIPT_POLL_SECONDS", "1"))
+ROLLOUT_START_TIMEOUT = float(os.environ.get("CODEX_ROLLOUT_START_TIMEOUT", "15"))
+CODEX_SESSIONS_DIR = os.environ.get(
+    "CODEX_SESSIONS_DIR", os.path.expanduser("~/.codex/sessions")
+)
+_ROLLOUT_PATH_CACHE: dict[str, str] = {}
 _ENGINE_RECOVERY_RETRIES = 1
 
 # 只请求**可展示的推理摘要**，不是原始私有推理。0.144.3 的 prolite 实测表明，必须在
@@ -73,6 +81,99 @@ _TOOL_ITEM_TYPES = {
     "commandExecution", "fileChange", "mcpToolCall", "toolCall",
     "webSearch", "patchApply", "localShellCall",
 }
+
+
+def _find_rollout_path(thread_id: str) -> Optional[str]:
+    """Locate Codex's persisted rollout for one thread."""
+    if not thread_id:
+        return None
+    cached = _ROLLOUT_PATH_CACHE.get(thread_id)
+    if cached and os.path.isfile(cached):
+        return cached
+    matches = glob.glob(
+        os.path.join(CODEX_SESSIONS_DIR, "**", f"*{thread_id}*.jsonl"),
+        recursive=True,
+    )
+    if not matches:
+        return None
+    path = max(matches, key=os.path.getmtime)
+    _ROLLOUT_PATH_CACHE[thread_id] = path
+    return path
+
+
+def _rollout_cursor(thread_id: str) -> tuple[Optional[str], int]:
+    """Snapshot the rollout tail immediately before ``turn/start``."""
+    path = _find_rollout_path(thread_id)
+    if not path:
+        return None, 0
+    try:
+        return path, os.path.getsize(path)
+    except OSError:
+        return None, 0
+
+
+def _rollout_has_progress(path: Optional[str], offset: int) -> bool:
+    if not path:
+        return False
+    try:
+        return os.path.getsize(path) > offset
+    except OSError:
+        return False
+
+
+def _completed_turn_from_rollout(
+    path: Optional[str], offset: int,
+) -> Optional[dict[str, Any]]:
+    """Recover only a completed turn's public commentary, answer and usage."""
+    if not path:
+        return None
+    commentary: list[str] = []
+    final_text: list[str] = []
+    usage: Optional[dict] = None
+    completed = False
+    try:
+        with open(path, "rb") as stream:
+            stream.seek(max(0, offset))
+            for raw_line in stream:
+                try:
+                    obj = json.loads(raw_line.decode("utf-8"))
+                except (UnicodeDecodeError, json.JSONDecodeError):
+                    continue
+                payload = obj.get("payload") or {}
+                if obj.get("type") == "event_msg":
+                    event_type = payload.get("type")
+                    if event_type == "token_count" and isinstance(payload.get("info"), dict):
+                        usage = _map_rollout_usage(payload["info"])
+                    elif event_type == "task_complete":
+                        completed = True
+                    continue
+                if obj.get("type") != "response_item":
+                    continue
+                if payload.get("type") == "reasoning":
+                    continue
+                if payload.get("type") != "message" or payload.get("role") != "assistant":
+                    continue
+                text = "".join(
+                    item.get("text") or ""
+                    for item in (payload.get("content") or [])
+                    if isinstance(item, dict) and item.get("type") == "output_text"
+                )
+                if not text:
+                    continue
+                if payload.get("phase") == "commentary":
+                    commentary.append(text)
+                else:
+                    final_text.append(text)
+    except OSError:
+        return None
+    full = "".join(final_text)
+    if not completed or not full:
+        return None
+    return {
+        "full": full,
+        "commentary_full": "".join(commentary),
+        "codex_turn_usage": usage,
+    }
 
 
 def _read_thread_ptr() -> Optional[str]:
@@ -183,6 +284,24 @@ def _map_usage(tu: Optional[dict]) -> dict:
     }
 
 
+def _map_rollout_usage(info: Optional[dict]) -> dict:
+    """Map persisted snake_case last-turn usage to the live contract."""
+    info = info or {}
+    usage = info.get("last_token_usage") or info.get("total_token_usage") or {}
+    return {
+        "input_tokens": int(usage.get("input_tokens") or 0),
+        "cached_input_tokens": int(usage.get("cached_input_tokens") or 0),
+        "output_tokens": int(usage.get("output_tokens") or 0),
+        "reasoning_output_tokens": int(usage.get("reasoning_output_tokens") or 0),
+        "total_tokens": int(usage.get("total_tokens") or 0),
+        "model_context_window": (
+            int(info["model_context_window"])
+            if isinstance(info.get("model_context_window"), (int, float))
+            else None
+        ),
+    }
+
+
 class CodexAppServer:
     """持久 codex app-server(--stdio · NDJSON JSON-RPC)· 单连接 · 一次一轮(锁)。"""
 
@@ -196,6 +315,8 @@ class CodexAppServer:
         self._turn_lock = asyncio.Lock()
         self._served_model = CODEX_MODEL or "default"
         self._rate_limited = False
+        self._turn_request_sent = False
+        self._rollout_only = False
         self._thread_id: Optional[str] = None   # 一个 engine 生命期一个活跃 thread(首轮 resolve)
 
     # ── 生命周期 ──────────────────────────────────────────────────────────
@@ -258,20 +379,40 @@ class CodexAppServer:
             msg["params"] = params
         await self._send(msg)
 
-    async def _request(self, method: str, params: dict) -> dict:
+    async def _begin_request(
+        self, method: str, params: dict,
+    ) -> tuple[int, "asyncio.Future"]:
+        """Write one RPC request and return its response future without waiting."""
         self._reqid += 1
         rid = self._reqid
         fut: "asyncio.Future" = asyncio.get_event_loop().create_future()
         self._pending[rid] = fut
         try:
             await self._send({"jsonrpc": "2.0", "id": rid, "method": method, "params": params})
-            resp = await asyncio.wait_for(fut, timeout=REQ_TIMEOUT)
-        finally:
-            # The reader may have popped it already; a second pop is harmless.
+        except BaseException:
             self._pending.pop(rid, None)
-        if "error" in resp:
-            raise RuntimeError(f"{method} error: {resp['error']}")
-        return resp.get("result") or {}
+            if not fut.done():
+                fut.cancel()
+            raise
+        return rid, fut
+
+    @staticmethod
+    def _unwrap_response(method: str, response: dict) -> dict:
+        if "error" in response:
+            raise RuntimeError(f"{method} error: {response['error']}")
+        return response.get("result") or {}
+
+    async def _request(
+        self, method: str, params: dict, *, timeout: Optional[float] = None,
+    ) -> dict:
+        rid, fut = await self._begin_request(method, params)
+        try:
+            response = await asyncio.wait_for(
+                fut, timeout=REQ_TIMEOUT if timeout is None else timeout,
+            )
+        finally:
+            self._pending.pop(rid, None)
+        return self._unwrap_response(method, response)
 
     def _fail_pending(self, reason: str) -> None:
         """Unblock RPC callers when the stdio connection cannot make progress."""
@@ -306,7 +447,7 @@ class CodexAppServer:
                 # 一律 approved(bypassPermissions 等价)· 否则工具调用挂死/被 cancel。
                 asyncio.create_task(self._auto_approve(obj))
             elif obj.get("method"):
-                if self._notif_q is not None:
+                if self._notif_q is not None and not self._rollout_only:
                     self._notif_q.put_nowait(obj)
 
     async def _drain_stderr(self) -> None:
@@ -378,18 +519,25 @@ class CodexAppServer:
                 await self._request("thread/resume", {
                     "threadId": ptr,
                     "config": _reasoning_summary_config(),
-                })
+                }, timeout=RESUME_TIMEOUT)
                 logger.info("codex thread resumed: %s", ptr)
                 return ptr
-            except Exception:  # noqa: BLE001
+            except RuntimeError:
                 # 配置被未来 CLI 拒绝不等于 thread 失效；先用裸 resume 保住上下文。
                 logger.warning("thread/resume 摘要配置被拒(%s)→ 无摘要重试", ptr, exc_info=True)
                 try:
-                    await self._request("thread/resume", {"threadId": ptr})
+                    await self._request(
+                        "thread/resume", {"threadId": ptr}, timeout=RESUME_TIMEOUT,
+                    )
                     logger.warning("codex thread 已无摘要续接: %s", ptr)
                     return ptr
                 except Exception:  # noqa: BLE001
                     logger.warning("thread/resume failed twice(%s)", ptr, exc_info=True)
+            except (asyncio.TimeoutError, ConnectionError, OSError):
+                logger.warning(
+                    "thread/resume transport silent(%s); recycle without bare retry",
+                    ptr, exc_info=True,
+                )
         # A failed resume can wedge this persistent stdio connection. Do not start
         # a replacement thread here: the module-level caller must recycle the
         # app-server first, then retry this silent turn exactly once.
@@ -456,6 +604,7 @@ class CodexAppServer:
             activities: list[dict] = []
             usage: dict = _map_usage(None)
             self._rate_limited = False
+            self._turn_request_sent = False
 
             def record_activity(activity: Optional[dict]) -> Optional[dict]:
                 nonlocal activities
@@ -472,10 +621,91 @@ class CodexAppServer:
                     params["model"] = model or CODEX_MODEL
                 if effort:
                     params["effort"] = effort
-                await self._request("turn/start", params)
+                rollout_path, rollout_offset = _rollout_cursor(thread_id)
+                self._turn_request_sent = True
+                deferred_request_id: Optional[int] = None
+                deferred_request: Optional["asyncio.Future"] = None
+                rollout_only = bool(getattr(self, "_rollout_only", False))
+                if rollout_only:
+                    deferred_request_id, deferred_request = await self._begin_request(
+                        "turn/start", params,
+                    )
+                else:
+                    await self._request("turn/start", params)
 
+                deadline = asyncio.get_running_loop().time() + TURN_TIMEOUT
+                rollout_start_deadline = (
+                    asyncio.get_running_loop().time() + ROLLOUT_START_TIMEOUT
+                )
                 while True:
-                    obj = await asyncio.wait_for(q.get(), timeout=TURN_TIMEOUT)
+                    if deferred_request is not None and deferred_request.done():
+                        response = deferred_request.result()
+                        self._unwrap_response("turn/start", response)
+                        deferred_request = None
+                    remaining = deadline - asyncio.get_running_loop().time()
+                    if remaining <= 0:
+                        raise asyncio.TimeoutError()
+                    try:
+                        obj = await asyncio.wait_for(
+                            q.get(),
+                            timeout=min(max(0.1, TRANSCRIPT_POLL_SECONDS), remaining),
+                        )
+                    except asyncio.TimeoutError:
+                        salvaged = await asyncio.to_thread(
+                            _completed_turn_from_rollout, rollout_path, rollout_offset,
+                        )
+                        if not salvaged:
+                            if (
+                                rollout_only
+                                and asyncio.get_running_loop().time() >= rollout_start_deadline
+                                and not _rollout_has_progress(rollout_path, rollout_offset)
+                            ):
+                                raise ConnectionError(
+                                    "rollout-only turn/start produced no RPC ack or rollout progress"
+                                )
+                            continue
+
+                        full = salvaged["full"]
+                        public_commentary = salvaged["commentary_full"]
+                        recovered_usage = salvaged.get("codex_turn_usage")
+                        if isinstance(recovered_usage, dict):
+                            usage = recovered_usage
+                        current_text = "".join(text_parts)
+                        current_commentary = "".join(commentary)
+                        if not (
+                            full.startswith(current_text)
+                            and public_commentary.startswith(current_commentary)
+                        ):
+                            continue
+                        commentary_suffix = public_commentary[len(current_commentary):]
+                        text_suffix = full[len(current_text):]
+                        if commentary_suffix:
+                            commentary.append(commentary_suffix)
+                            yield {"commentary_delta": commentary_suffix}
+                        if text_suffix:
+                            text_parts.append(text_suffix)
+                            yield {"delta": text_suffix}
+
+                        self._rollout_only = True
+                        logger.warning(
+                            "codex stdio silent; entering rollout-only completion: %s",
+                            thread_id,
+                        )
+                        yield {
+                            "done": True,
+                            "full": "".join(text_parts),
+                            "parts": [{"type": "text", "text": "".join(text_parts)}],
+                            "codex_thinking_full": "".join(codex_thinking),
+                            "commentary_full": "".join(commentary),
+                            "activities": activities,
+                            "usage_source": "codex",
+                            "codex_turn_tokens": usage["total_tokens"],
+                            "codex_turn_usage": usage,
+                            "model": self._served_model,
+                            "rate_limited": self._rate_limited,
+                            "recovered_from_rollout": True,
+                        }
+                        return
                     m = obj.get("method") or ""
                     p = obj.get("params") or {}
                     if m == "item/started":
@@ -588,6 +818,16 @@ class CodexAppServer:
                        "codex_turn_usage": usage, "model": self._served_model,
                        "rate_limited": self._rate_limited}
             finally:
+                if "deferred_request_id" in locals() and deferred_request_id is not None:
+                    self._pending.pop(deferred_request_id, None)
+                if "deferred_request" in locals() and deferred_request is not None:
+                    if deferred_request.done():
+                        try:
+                            deferred_request.exception()
+                        except (asyncio.CancelledError, Exception):
+                            pass
+                    else:
+                        deferred_request.cancel()
                 self._notif_q = None
 
 
@@ -632,8 +872,9 @@ async def stream_codex_turn(
         except (asyncio.TimeoutError, ConnectionError, OSError, RuntimeError):
             logger.warning("codex turn failed (attempt=%d emitted=%s); recycle engine",
                            attempt + 1, emitted, exc_info=True)
+            turn_request_sent = bool(getattr(eng, "_turn_request_sent", False))
             await _discard_engine(eng)
-            if not emitted and attempt < _ENGINE_RECOVERY_RETRIES:
+            if not emitted and not turn_request_sent and attempt < _ENGINE_RECOVERY_RETRIES:
                 logger.info("retrying silent codex turn once on a fresh app-server")
                 continue
             raise

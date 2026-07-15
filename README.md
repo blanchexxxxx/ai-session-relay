@@ -7,7 +7,7 @@ It is intentionally only a local HTTP/NDJSON service. There is no web UI, databa
 ## What it keeps
 
 - Claude Code: persistent session pointer, safe resume fallback, transcript forge/trim, and empty-turn recovery.
-- Codex: persistent `app-server`, `thread/resume`, bad-thread cleanup, and one safe retry after a silent wedge.
+- Codex: persistent `app-server`, `thread/resume`, completed-rollout recovery, bad-thread cleanup, and no replay after a possibly-started turn.
 - Engine switching: one local JSON state file with the active provider, a monotonic epoch, and a bounded recent handoff.
 - Streaming: the existing `delta`, activity, provider-specific thinking/usage, and final `done` NDJSON events.
 
@@ -85,6 +85,9 @@ No environment variables are required. Optional variables:
 | `AI_RELAY_HISTORY_MESSAGES` | `60` |
 | `AI_RELAY_HANDOFF_CHARS` | `24000` |
 | `CODEX_MODEL` | Codex CLI default |
+| `CODEX_RESUME_TIMEOUT` | `15` seconds |
+| `CODEX_ROLLOUT_START_TIMEOUT` | `15` seconds without RPC ack or rollout progress |
+| `CODEX_TRANSCRIPT_POLL_SECONDS` | `1` second |
 
 Existing MCP configuration remains owned by each CLI; this relay does not require or rewrite it.
 
@@ -254,6 +257,8 @@ curl -sN http://127.0.0.1:8900/chat_stream \
 ## License
 
 AGPL-3.0-or-later. Copyright © 2026 blanche.x. Extracted from the production-proven session continuity engine in the original project, with private identity, infrastructure, and memory-system coupling removed.
+
+See [`CONTRIBUTING.md`](CONTRIBUTING.md) for the generated-mirror contribution flow.
 
 ## 致谢
 

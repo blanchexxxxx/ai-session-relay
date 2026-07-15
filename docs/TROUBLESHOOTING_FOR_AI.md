@@ -97,16 +97,24 @@
 - 已捕获失败链：`thread/resume` timeout/failure 后，同一持久 app-server 上紧接 `thread/start` 也 timeout。
 - 这不是普通“坏 thread”单点问题；失败请求可能已污染连接/reader/pending 状态。
 - 正确恢复：条件清理坏 pointer → close/kill 当前 app-server → 新建连接并重新 initialize → silent turn 重试一次。
+- transport timeout/EOF 不是“摘要配置 schema 被拒”。前者只等一次有界 `CODEX_RESUME_TIMEOUT` 后回收；只有收到明确 RPC error 时，才允许去掉可选 config 裸 resume 一次。
+
+### rollout 完成不代表 RPC response 通道健康
+
+- Codex app-server 可能已经接收并完成 `turn/start`、把 `task_complete` 写入 rollout，却漏掉对应 RPC ack 和 turn notifications。
+- 每轮发送前记录该 thread rollout 的 byte offset；live queue 静默时只读 offset 后的新记录。必须同时看到 `task_complete` 和 final `output_text` 才能收口，且绝不读取 raw/encrypted reasoning。
+- 一次完成态回收后进入 rollout-only：后续 `turn/start` 只发送一次，立刻观察 rollout，不先白等通用 RPC timeout。明确 RPC error 仍立即失败；既无 ack 又无 rollout 新字节满 `CODEX_ROLLOUT_START_TIMEOUT` 才回收。
+- rollout-only 的未决 response future 在成功、异常和取消路径都必须清理，避免迟到 response 污染下一轮。
 
 ### 清坏指针必须防竞态
 
 - `_clear_thread_ptr(expected)` 删除前重新读取当前值；只有仍等于 expected 才删。
 - 不带 expected 的盲删可能删除另一协程刚写入的新 thread pointer。
 
-### Codex 重试闸同样以“是否已输出”为界
+### Codex 重试闸以“turn 是否可能已发送”为硬边界
 
-- `stream_codex_turn` 只在本轮尚未 yield 任何事件时回收 engine 并重试一次。
-- 一旦收到 delta/activity/tool event，即使最终没 done，也必须假设工具副作用可能发生，禁止重放。
+- `stream_codex_turn` 只有在 `turn/start` 尚未尝试写出时，才允许新进程重试一次。
+- 一旦尝试写出 turn，即使还没有任何 delta/activity，也必须假设模型或工具可能已执行，禁止重放。
 - app-server EOF 时要 fail 全部 `_pending` future；否则调用者一直等到各自 timeout。
 
 ### token usage 必须取 last，不取 total
