@@ -966,6 +966,47 @@ def last_assistant_model(events):
     return None
 
 
+def effective_threshold_model(intent_model, sid=None, events=None, cwd=WORKSPACE_DIR):
+    """Pick which model's context window the forge thresholds should use: whichever of the
+    *intended* and the *actually running* model has the SMALLER window.
+
+    Why: the intended model id (what you pass as `--model`) and what the transcript reports
+    can disagree for a long time. The common case is a context-window variant suffix --
+    `<model>[1m]` vs the bare `<model>` -- because `--model` cannot change the variant when
+    resuming an existing session, and route-guard drift detection is deliberately
+    suffix-insensitive, so the mismatch is never reported and never self-heals. If thresholds
+    are computed from the intent, the session is allowed to grow toward the *large* window
+    while the real one is small, so every turn past the real limit runs over the window.
+
+    Taking the min fixes it both ways: it converges on the real window now, and if the variant
+    ever does take effect the actual model becomes the large one and the min opens back up --
+    no code change needed.
+
+    IMPORTANT: only converge across *window variants of the same model*. Across genuinely
+    different models (a user just switched from one model to a newer one) the mismatch is
+    transient -- the next turn catches up -- and converging there would keep trimming the new
+    large-window session by the old small-window trigger.
+
+    `events` wins when the caller already read the transcript; otherwise read it from `sid`.
+    Unknown actual model / missing transcript / any error -> fall back to `intent_model`.
+    Read-only, fail-safe, never raises."""
+    if not intent_model:
+        return intent_model
+    try:
+        if events is None:
+            if not sid:
+                return intent_model
+            events = read_jsonl(session_path(sid, cwd=cwd))
+        actual = last_assistant_model(events)
+        if not actual:
+            return intent_model
+        if route_model_key(actual) != route_model_key(intent_model):
+            return intent_model
+        return actual if model_window(actual) < model_window(intent_model) else intent_model
+    except Exception:  # noqa: BLE001 - a threshold helper must never gate a turn
+        return intent_model
+
+
 def scan_route_guard(events, target_model):
     """PDF 7.3:扫 assistant 事件的 message.model,找第一次偏离 target 的位置。
     返回 None(无漂移)或 {drift_index, anchor_index, target_model, actual_model}。"""
