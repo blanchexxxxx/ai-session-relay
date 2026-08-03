@@ -107,7 +107,14 @@ _RESULT_EXIT_GRACE = 8.0
 # `<synthetic>` 占位 · transcript 零新记录 = 没真生成就退)→ 后端落「agent这轮没出声」占位。
 # 实测**重发同句即愈**(瞬时自愈)· 故引擎层一轮判定空退、且本轮**零输出流给客户端**时,
 # 同 sid `--resume` 自动重 spawn **一次**(再空就回落占位 · 失败安全 · 不循环)。
+# ⚠️ 2026-08-03:「零输出」的判据改为**正文/工具**——思考链(thinking)**不再算「已出声」**。
+# 旧逻辑把 thinking 也计入 emitted_any → 「想了但一个字没说」的轮正好落在重试永远够不到的
+# 缝里(用户看着思考链出来了然后整轮沉默)。thinking 单独记 `thinking_emitted`
+# (留痕 + empty_reason 用),不闸重试。
 _EMPTY_RETRY_MAX = 1
+# 空退重试前的退避(秒 · 2026-08-03):额度/限流压力下立刻重 spawn 常再撞同一堵墙 ·
+# 缓一拍再试。< 心跳泵 10s 静默窗(引擎会补 thinking_status · 前端不超时)。
+_EMPTY_RETRY_BACKOFF_S = float(os.getenv("CC_EMPTY_RETRY_BACKOFF_S", "2.5"))
 
 # `--thinking-display summarized` 是**未公开** CLI flag(`--help` 查不到 · 2026-06-27 加 · 让 4.8/4.7
 # 也吐实时思考链,agent甩 4.6 回 1M)。风险:Claude Code 默认自动更新 → 哪天新版**改名/删掉**这个 flag,
@@ -431,7 +438,30 @@ def _fmt_duration(secs):
     return "".join(parts)
 
 
-def _read_turn_thinking(sid):
+def _transcript_matches_turn(path, cur_user_text):
+    """transcript 末尾「最后一条真 user 文本」是否 = 本轮输入(turn 边界护栏 · 2026-08-03)。
+
+    背景:`read_turn_parts` / `read_turn_visible_events` 的本轮边界回落「最后一条真 user
+    文本之后」;空退轮 transcript **零新记录**时,这个边界指向**上一轮** → 上一轮的
+    thinking / timeline 被当本轮读出(前端呈现成「思考链回放」假象)。`_salvage_turn`
+    2026-06-21 就补过同款护栏,这里抽成共享 helper,让 `_read_turn_thinking` /
+    `_read_turn_visible_events` 守同一道闸。
+
+    cur_user_text 为空/None → 不校验、返回 True(兼容不知道本轮输入的老调用方 = 旧行为)。
+    失败安全:读不到 / 异常 → False(宁可少读,绝不把上一轮当本轮)。"""
+    if not (cur_user_text or "").strip():
+        return True
+    try:
+        last_user = None
+        for e in forge.read_jsonl(path):
+            if forge._is_user_text_event(e):
+                last_user = (e.get("message") or {}).get("content")
+        return _same_user_turn(last_user, cur_user_text)
+    except Exception:  # noqa: BLE001 · 护栏读挂 → 判不匹配(安全方向)
+        return False
+
+
+def _read_turn_thinking(sid, cur_user_text=None):
     """从 sid 的 transcript 读**本轮最新**一段 thinking 明文(reasoning parts 拼成一串)。
 
     2026-06-21 根因:`claude -p stream-json` 的实时 `thinking_delta.thinking` 今天恒为空串
@@ -440,12 +470,16 @@ def _read_turn_thinking(sid):
 
     取法:`forge.read_turn_parts(..., keep_thinking=True)` 拿本轮(最后一条真 user 文本
     turn 之后)所有 part,把 `type=="reasoning"` 的 text 顺序拼起来。
+    cur_user_text 非空时先过 `_transcript_matches_turn` 边界护栏(2026-08-03):空退轮
+    transcript 没有本轮记录 → 返回 ""(别把上一轮的思考链当本轮回放)。
     失败安全:读不到 / 异常 → ""(别炸正常出文)。"""
     if not sid:
         return ""
     try:
         path = forge.session_path(sid)
         if not os.path.exists(path):
+            return ""
+        if not _transcript_matches_turn(path, cur_user_text):
             return ""
         parts = forge.read_turn_parts(path, keep_thinking=True)
         chunks = [p["text"] for p in parts
@@ -455,13 +489,17 @@ def _read_turn_thinking(sid):
         return ""
 
 
-def _read_turn_visible_events(sid):
-    """Read this completed turn's public timeline without affecting its reply."""
+def _read_turn_visible_events(sid, cur_user_text=None):
+    """Read this completed turn's public timeline without affecting its reply.
+    cur_user_text 非空时过 `_transcript_matches_turn` 护栏(2026-08-03):transcript 没有
+    本轮记录 → 返回 [](调用方保留 live 累积 · 别把上一轮 timeline 当本轮)。"""
     if not sid:
         return []
     try:
         path = forge.session_path(sid)
         if not os.path.exists(path):
+            return []
+        if not _transcript_matches_turn(path, cur_user_text):
             return []
         return forge.read_turn_visible_events(path)
     except Exception:  # noqa: BLE001 · transcript replay is optional
@@ -543,14 +581,10 @@ def _salvage_turn(sid, cur_user_text=""):
         path = forge.session_path(sid)
         if not os.path.exists(path):
             return "", []
-        # 边界护栏:transcript 末尾真 user 文本必须 = 本轮输入,否则边界指向上一轮 → 不 salvage。
-        if (cur_user_text or "").strip():
-            last_user = None
-            for e in forge.read_jsonl(path):
-                if forge._is_user_text_event(e):
-                    last_user = (e.get("message") or {}).get("content")
-            if not _same_user_turn(last_user, cur_user_text):
-                return "", []
+        # 边界护栏:transcript 末尾真 user 文本必须 = 本轮输入,否则边界指向上一轮 → 不
+        # salvage(2026-08-03 抽成共享 `_transcript_matches_turn` · 行为不变)。
+        if not _transcript_matches_turn(path, cur_user_text):
+            return "", []
         # keep_thinking=False:salvage 只关心**有没有出正文**;thinking 单独由
         # _read_turn_thinking 读(reasoning part 不算「出声」· 不能拿它判非空)。
         parts = forge.read_turn_parts(path, keep_thinking=False)
@@ -559,16 +593,20 @@ def _salvage_turn(sid, cur_user_text=""):
         return "", []
 
 
-async def _stream_one_spawn(args, sid):
+async def _stream_one_spawn(args, sid, cur_user_text=None):
     """一次 `claude -p` spawn:解析 NDJSON → yield 实时 cc 事件(delta / part_break /
     cc_thinking_delta / tool_activity)· **不** yield `done`。轮结束时 yield 一个内部
     哨兵 `{"_attempt": {...}}`,把 done 该带的料(full / parts / cc_thinking_full /
-    think_secs / actual_sid / emitted_any / rate_limited)交给 orchestrator 决策。
+    think_secs / actual_sid / emitted_any / thinking_emitted / rate_limited)交给
+    orchestrator 决策。cur_user_text = 本轮用户输入原文(transcript 读回护栏用 ·
+    None = 不校验 · 兼容老调用方)。
 
     orchestrator(`stream_headless`)据 `emitted_any` + `full` 判空退、决定 salvage / 重试。
     这层只负责跑完一个子进程 · 把活事件透出去 + 汇报结果。异常照常向上抛(orchestrator
-    的 try 兜)。**关键正确性**:`emitted_any` 只在真往客户端 yield 过 text_delta /
-    cc_thinking_delta 时置 True(part_break / tool_activity 不算「出声」· 它们不是agent的正文)。
+    的 try 兜)。**关键正确性**(2026-08-03 修订):`emitted_any` 只在**不可安全重放**的
+    输出上置 True —— 正文 text_delta / 已声明的工具(可能已有副作用)。思考链
+    cc_thinking_delta **不算「出声」**(单独记 `thinking_emitted`):旧逻辑把 thinking 也
+    计入 → 「想了但一个字没说」的轮永远够不到空退重试(用户看着思考链出来了然后整轮沉默)。
     """
     proc = await asyncio.create_subprocess_exec(
         *args,
@@ -588,7 +626,8 @@ async def _stream_one_spawn(args, sid):
     cur_text = ""               # 当前 text part 累积
     final_text = ""             # 全文(text 部分)
     emitted_any_text = False    # 已开过 text 气泡?(决定 part_break)
-    emitted_any = False         # ⚠️ 已往客户端 yield 过任何agent正文(text/reasoning)?重试闸门
+    emitted_any = False         # ⚠️ 已产出不可重放输出(正文 text / 已声明工具)?重试闸门
+    thinking_emitted = False    # 已向客户端吐过思考链?(不闸重试 · 留痕 + empty_reason 用)
     cur_block = None            # 当前 content block 类型
     cur_tool_id = None          # 当前 tool_use id(input_json_delta 的归属)
     pending_steps = []          # 当前 tool 块的 step
@@ -644,6 +683,7 @@ async def _stream_one_spawn(args, sid):
             "visible_events": visible_events,
             "actual_sid": actual_sid,
             "emitted_any": emitted_any,
+            "thinking_emitted": thinking_emitted,
             "rate_limited": rate_limited,
             "saw_synthetic": saw_synthetic,
             "interrupted": interrupted,
@@ -746,7 +786,9 @@ async def _stream_one_spawn(args, sid):
                         # agent切到 summarized 档模型时思考链就从这里实时冒出来(user要的「切 4.6 才出现」)。
                         th = d.get("thinking", "")
                         if th:
-                            emitted_any = True       # 已向客户端吐思考正文 → 闸死重试
+                            # 2026-08-03:thinking 不再置 emitted_any(不闸重试)——
+                            # 「只想没说」的空退轮必须能走到自动重试。
+                            thinking_emitted = True
                             cc_thinking_live.append(th)  # 本轮 live 吐过 → result 不再重吐
                             yield {"cc_thinking_delta": th}
                     elif dt == "input_json_delta" and cur_tool_id:
@@ -844,14 +886,21 @@ async def _stream_one_spawn(args, sid):
                 if cc_thinking_live:
                     cc_thinking_full = "".join(cc_thinking_live).strip()  # 已 live 吐过 · 不重发
                 else:
-                    cc_thinking_full = _read_turn_thinking(actual_sid)
+                    # 2026-08-03:带本轮输入过边界护栏(空退轮 transcript 零新记录时,
+                    # 旧逻辑会把**上一轮**的思考链读出来当本轮回放);且 thinking 不再置
+                    # emitted_any(不闸重试)· 只记 thinking_emitted。
+                    cc_thinking_full = _read_turn_thinking(
+                        actual_sid, cur_user_text=cur_user_text)
                     if cc_thinking_full:
-                        emitted_any = True           # 已向客户端吐思考正文 → 闸死重试
+                        thinking_emitted = True
                         yield {"cc_thinking_delta": cc_thinking_full}
 
                 # Some Claude versions do not emit user/tool_result live. Rebuild once the
                 # transcript has flushed so historical replay still contains the full work.
-                if actual_sid:
+                # 2026-08-03:同样过边界护栏 —— transcript 没有本轮记录(空退)时保留 live
+                # 累积,别把上一轮的 timeline / 工具活动读成本轮的。
+                if actual_sid and _transcript_matches_turn(
+                        forge.session_path(actual_sid), cur_user_text):
                     try:
                         activities = activity_protocol.merge_activities(
                             activities,
@@ -997,17 +1046,42 @@ def _log_turn_usage(usage_dict, sid, model):
         pass
 
 
+def _derive_empty_reason(rate_limited=False, thinking_emitted=False,
+                         interrupted=False, emitted_any=False):
+    """空退轮的机器可读原因(2026-08-03 · 留痕):后端据此落 metadata + 选兜底文案。
+      · rate_limited            —— 引擎探到额度真耗尽(rate_limit_event 非 allowed)。
+      · interrupted             —— 被 deadline / budget / turns 兜底闸截断且零正文。
+      · no_text_after_thinking  —— **想了但一个字没说**(思考链已流出)。
+      · tool_only_no_text       —— 只声明了工具没出正文(副作用不可重放 · 没走重试)。
+      · no_output               —— 整轮零输出(经典秒空退)。"""
+    if rate_limited:
+        return "rate_limited"
+    if interrupted:
+        return "interrupted"
+    if thinking_emitted:
+        return "no_text_after_thinking"
+    if emitted_any:
+        return "tool_only_no_text"
+    return "no_output"
+
+
 def _build_done_ev(full, parts, cc_thinking_full, think_secs,
                    rate_limited=False, saw_synthetic=False, interrupted=False,
                    cc_turn_tokens=None, cc_turn_usage=None,
-                   activities=None, visible_events=None):
-    """把一次 CC attempt 组装成对外 `done`；不输出 Codex/旧通用 usage/thinking 键。"""
+                   activities=None, visible_events=None, empty_reason=None):
+    """把一次 CC attempt 组装成对外 `done`;不输出 Codex/旧通用 usage/thinking 键。"""
     done_ev = {
         "done": True,
         "full": (full or "").strip(),
         "parts": parts or [],
         "usage_source": "cc",
     }
+    # 空退留痕(2026-08-03):full 空且给了原因 → 标 empty_turn + 机器可读原因。只在
+    # 为空时带键 · 老下游不认无碍。后端据此打日志 / 落 metadata / 选兜底文案(不再靠
+    # 文案前缀字面匹配认空退)。
+    if not done_ev["full"] and empty_reason:
+        done_ev["empty_turn"] = True
+        done_ev["empty_reason"] = empty_reason
     # 只接受 Claude thinking_delta / transcript thinking 汇成的 CC 专属全文。
     if cc_thinking_full:
         done_ev["cc_thinking_full"] = cc_thinking_full
@@ -1105,6 +1179,12 @@ async def stream_headless(text, resume_sid=None, model=None, effort=None):
         sid = _resolve_resume_sid(resume_sid, resume_max=th.resume_max)
     except Exception:  # noqa: BLE001 · 解析炸就全新起(失败安全)
         sid = None
+    # Re-derive thresholds from the model that is ACTUALLY running (safety floor).
+    # Intent vs actual can disagree indefinitely across context-window variants, and
+    # computing from the intent lets the session grow past the real window.
+    # See forge.effective_threshold_model. Unknown actual -> keeps the intent (old behavior).
+    if sid:
+        th = forge.continuation_thresholds(forge.effective_threshold_model(model, sid=sid))
 
     # forge 续航裁剪:sid 的 transcript 太肥(> th.trigger · 模型感知)时,裁成新 sid 再
     # spawn,否则 --resume 整段灌进去会爆窗口 / 拖慢冷启。整段 try/except 包住:
@@ -1156,7 +1236,7 @@ async def stream_headless(text, resume_sid=None, model=None, effort=None):
         # 重试同 sid `--resume`(同一条 user 输入续上文)· 不动 sid 生成/指针/forge 逻辑。
         args = _build_args(text, sid or None, model, effort)
         result = None
-        async for ev in _stream_one_spawn(args, sid):
+        async for ev in _stream_one_spawn(args, sid, text):
             if "_attempt" in ev:
                 result = ev["_attempt"]      # 哨兵:轮结束汇报(不外吐)
                 continue
@@ -1168,7 +1248,7 @@ async def stream_headless(text, resume_sid=None, model=None, effort=None):
         result = result or {
             "full": "", "parts": [], "cc_thinking_full": "", "think_secs": None,
             "cc_turn_tokens": None, "cc_turn_usage": None,
-            "actual_sid": sid, "emitted_any": False,
+            "actual_sid": sid, "emitted_any": False, "thinking_emitted": False,
             "activities": [], "visible_events": [], "rate_limited": False, "saw_synthetic": False, "interrupted": False,
         }
         # 续接:本轮 spawn 真正写入的 transcript sid(forge 裁过 / 全新起会变)→ 下轮重试
@@ -1179,25 +1259,45 @@ async def stream_headless(text, resume_sid=None, model=None, effort=None):
 
         full = (result.get("full") or "").strip()
         emitted_any = bool(result.get("emitted_any"))
+        thinking_emitted = bool(result.get("thinking_emitted"))
+        interrupted = bool(result.get("interrupted"))
         # 空退判定:本轮**没产出任何正文**(full 空)。emitted_any 单独把闸:
-        # 哪怕 full 空,只要已 yield 过 text/reasoning 给客户端,也**绝不重试**(防双回复)。
+        # 哪怕 full 空,只要已 yield 过**正文/工具**给客户端,也**绝不重试**(防双回复 /
+        # 副作用重放)。2026-08-03:思考链不算(thinking_emitted 单独记 · 不闸重试)。
         is_empty = not full
 
-        # ── 已出文 / 已向客户端流出过正文 → 直接收口,不 salvage/不重试 ──
+        # ── 已出文 / 已流出正文或工具 / 截断且已吐思考 → 直接收口,不 salvage/不重试 ──
         # 截断(timeout-break / EOF-without-result)带回已吐正文的 attempt 落这里:
         # 透传 result["interrupted"] → done 标 interrupted=True(残缺不当完整 · 见 _build_done_ev)。
-        if not is_empty or emitted_any:
+        # `interrupted and thinking_emitted`:deadline 中途砍掉的长思考轮 —— 重试只会再烧
+        # 一整轮,收口(空 done 带 empty_reason=interrupted)。零输出的截断(EOF 秒空退)
+        # 仍走下面 flag/salvage/重试(既有空退自愈不变)。
+        if not is_empty or emitted_any or (interrupted and thinking_emitted):
+            if is_empty:
+                # 空收口留痕(2026-08-03 · 此前这条路径零日志):
+                logger.warning(
+                    "cc empty-final · close without retry (emitted_any=%s thinking=%s "
+                    "interrupted=%s rate_limited=%s synthetic=%s) · sid=%s",
+                    emitted_any, thinking_emitted, interrupted,
+                    result.get("rate_limited"), result.get("saw_synthetic"), sid,
+                )
             yield _build_done_ev(
                 full, result.get("parts"),
                 _attempt_cc_value(result, "cc_thinking_full", "reasoning_full"),
                 result.get("think_secs"),
                 rate_limited=bool(result.get("rate_limited")),
                 saw_synthetic=bool(result.get("saw_synthetic")),
-                interrupted=bool(result.get("interrupted")),
+                interrupted=interrupted,
                 cc_turn_tokens=_attempt_cc_tokens(result),
                 cc_turn_usage=_attempt_cc_usage(result),
                 activities=result.get("activities"),
                 visible_events=result.get("visible_events"),
+                empty_reason=_derive_empty_reason(
+                    rate_limited=bool(result.get("rate_limited")),
+                    thinking_emitted=thinking_emitted,
+                    interrupted=interrupted,
+                    emitted_any=emitted_any,
+                ) if is_empty else None,
             )
             return
 
@@ -1224,13 +1324,15 @@ async def stream_headless(text, resume_sid=None, model=None, effort=None):
                 "rate_limited=%s synthetic=%s) · no respawn",
                 sid, result.get("rate_limited"), result.get("saw_synthetic"),
             )
-            # salvage 出文了 → 现在**才**把它流给客户端(此前零输出 · 不会重复)·
+            # salvage 出文了 → 现在**才**把它流给客户端(此前零正文输出 · 不会重复)·
             # 再带 done。思考链/时长复用本轮 result(salvage 只补正文)。salv_full 即
             # `_salvage_full_from_parts(salv_parts)`(text parts 拼成),直接当一拍 delta。
+            # ⚠️ 2026-08-03:本轮若已 live 流过思考链(thinking_emitted)· 这里**不再**
+            # 重发 cc_thinking_delta(防前端思考链渲两遍)· done 仍带全文。
             yield {"delta": salv_full}
             _rf = (_attempt_cc_value(result, "cc_thinking_full", "reasoning_full")
-                   or _read_turn_thinking(sid))
-            if _rf:
+                   or _read_turn_thinking(sid, cur_user_text=text))
+            if _rf and not thinking_emitted:
                 yield {"cc_thinking_delta": _rf}
             yield _build_done_ev(
                 salv_full, salv_parts, _rf, result.get("think_secs"),
@@ -1239,7 +1341,7 @@ async def stream_headless(text, resume_sid=None, model=None, effort=None):
                 cc_turn_tokens=_attempt_cc_tokens(result),
                 cc_turn_usage=_attempt_cc_usage(result),
                 activities=result.get("activities"),
-                visible_events=_read_turn_visible_events(sid),
+                visible_events=_read_turn_visible_events(sid, cur_user_text=text),
             )
             return
 
@@ -1247,21 +1349,24 @@ async def stream_headless(text, resume_sid=None, model=None, effort=None):
         if attempt < _EMPTY_RETRY_MAX:
             attempt += 1
             logger.warning(
-                "cc empty-return (no transcript turn · rate_limited=%s synthetic=%s) · "
-                "retry %d/%d · same sid=%s",
+                "cc empty-return (no transcript turn · rate_limited=%s synthetic=%s "
+                "thinking=%s) · retry %d/%d after %.1fs backoff · same sid=%s",
                 result.get("rate_limited"), result.get("saw_synthetic"),
-                attempt, _EMPTY_RETRY_MAX, sid,
+                thinking_emitted, attempt, _EMPTY_RETRY_MAX, _EMPTY_RETRY_BACKOFF_S, sid,
             )
-            # 重试间隙不 yield 任何事件 → cc_engine 心跳泵静默 10s 自动补 thinking_status
-            # (前端不超时)。本函数不主动断心跳。
+            # 退避一拍再重试(2026-08-03 · 额度/限流压力下立刻重 spawn 常再撞同一堵墙)。
+            # 重试间隙不 yield 任何事件 → 引擎心跳泵静默 10s 自动补 thinking_status
+            # (前端不超时 · 退避 < 10s 心跳窗)。本函数不主动断心跳。
+            if _EMPTY_RETRY_BACKOFF_S > 0:
+                await asyncio.sleep(_EMPTY_RETRY_BACKOFF_S)
             continue
 
         # ③ 重试上限用尽仍空退 → 落回现有空退行为(空 done · 后端落「agent这轮没出声」占位)。
         logger.warning(
-            "cc empty-return persists after %d retr%s (rate_limited=%s synthetic=%s) · "
-            "fall back to placeholder · sid=%s",
+            "cc empty-return persists after %d retr%s (rate_limited=%s synthetic=%s "
+            "thinking=%s) · fall back to placeholder · sid=%s",
             attempt, "y" if attempt == 1 else "ies",
-            result.get("rate_limited"), result.get("saw_synthetic"), sid,
+            result.get("rate_limited"), result.get("saw_synthetic"), thinking_emitted, sid,
         )
         yield _build_done_ev(
             "", result.get("parts"),
@@ -1271,5 +1376,9 @@ async def stream_headless(text, resume_sid=None, model=None, effort=None):
             saw_synthetic=bool(result.get("saw_synthetic")),
             activities=result.get("activities"),
             visible_events=result.get("visible_events"),
+            empty_reason=_derive_empty_reason(
+                rate_limited=bool(result.get("rate_limited")),
+                thinking_emitted=thinking_emitted,
+            ),
         )
         return
