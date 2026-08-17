@@ -25,6 +25,25 @@ if _ROOT not in sys.path:
 import cc_headless  # noqa: E402
 
 
+def test_provider_failures_are_reduced_to_stable_public_codes():
+    classify = cc_headless._classify_engine_error
+    assert classify("authentication_failed", "Not logged in") == "auth_required"
+    assert classify("rate limit five_hour") == "rate_limited"
+    assert classify("invalid model: unavailable") == "model_unavailable"
+    assert classify("private implementation detail") is None
+
+
+def test_done_event_carries_public_error_code_without_raw_detail():
+    event = cc_headless._build_done_ev(
+        "", [], "", None,
+        empty_reason="auth_required", error_code="auth_required",
+    )
+    assert event["empty_turn"] is True
+    assert event["empty_reason"] == "auth_required"
+    assert event["error_code"] == "auth_required"
+    assert "error" not in event
+
+
 # ── fake 子进程(同 timeout-carry 测的最小复刻)────────────────────────────────
 class _FakeStdout:
     def __init__(self, lines):
@@ -167,6 +186,20 @@ def test_no_usage_anywhere_is_none(monkeypatch):
     assert len(attempts) == 1
     assert attempts[0]["cc_turn_tokens"] is None
     assert attempts[0]["cc_turn_usage"] is None
+
+
+def test_explicit_unknown_result_error_uses_generic_engine_code(monkeypatch):
+    result_ev = {
+        "type": "result",
+        "subtype": "error_during_execution",
+        "is_error": True,
+        "result": "private provider detail",
+    }
+    _patch_spawn(monkeypatch, [json.dumps(result_ev)])
+
+    attempts = asyncio.run(_collect(["claude"], "sid-x"))
+
+    assert attempts[0]["error_code"] == "engine_error"
 
 
 # ③ done wire contract：只写 CC 专属字段 ─────────────────────────────────────

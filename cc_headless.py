@@ -181,6 +181,28 @@ def _rate_limit_event_exhausted(e):
     return st not in ("allowed", None)
 
 
+def _classify_engine_error(*values):
+    """Reduce unstable provider/CLI failures to public, stable codes."""
+    text = " ".join(str(value) for value in values if value is not None).lower()
+    if not text:
+        return None
+    if any(marker in text for marker in (
+        "authentication_failed", "not logged in", "please run /login",
+        "authentication failed", "unauthorized", "oauth token has expired",
+    )):
+        return "auth_required"
+    if any(marker in text for marker in (
+        "rate_limit", "rate limit", "usage limit", "quota exceeded", "five_hour",
+    )):
+        return "rate_limited"
+    if any(marker in text for marker in (
+        "model_not_found", "model not found", "invalid model", "unsupported model",
+        "model is not available", "model unavailable",
+    )):
+        return "model_unavailable"
+    return None
+
+
 def read_last_session():
     try:
         return open(LAST_SESSION_FILE, encoding="utf-8").read().strip() or None
@@ -633,6 +655,7 @@ async def _stream_one_spawn(args, sid, cur_user_text=None):
     pending_steps = []          # 当前 tool 块的 step
     rate_limited = False        # 见 rate_limit_event(额度信号 · 观测用)
     saw_synthetic = False       # 见 <synthetic> 占位残片(额度压力空退信号 · 观测用)
+    engine_error_code = None    # provider/CLI explicit failure; raw text stays private
     cc_thinking_full = ""       # 本轮 CC 思考链明文(summarized 走 live;omitted 在 result 后读 transcript)
     cc_thinking_live = []       # 2026-06-25 · live thinking_delta 明文累积(summarized 模型如 opus-4.6 /
                                 # sonnet-4.6 实时吐摘要)· 非空 = 本轮已 live 转发思考 → result 不再从
@@ -686,6 +709,7 @@ async def _stream_one_spawn(args, sid, cur_user_text=None):
             "thinking_emitted": thinking_emitted,
             "rate_limited": rate_limited,
             "saw_synthetic": saw_synthetic,
+            "error_code": engine_error_code,
             "interrupted": interrupted,
         }
 
@@ -842,6 +866,11 @@ async def _stream_one_spawn(args, sid, cur_user_text=None):
                 # result.result 是 CLI 给的权威全文;没有就回落已累积 final_text。
                 # 写回 final_text 让 _make_attempt 取到同一个值(它读 final_text)。
                 final_text = (e.get("result") or final_text or "").strip()
+                if e.get("is_error") or str(e.get("subtype") or "").startswith("error"):
+                    engine_error_code = (
+                        _classify_engine_error(e.get("subtype"), e.get("error"), e.get("result"))
+                        or "engine_error"
+                    )
 
                 # 学模型上下文窗口(#173 · 不写死 forge 阈值):result.modelUsage.<model>.contextWindow
                 # 是 CC 自己报的真实窗口 → 持久 → 下轮 forge 阈值用真值(opus-4-8 实测 1M)。失败安全。
@@ -935,6 +964,16 @@ async def _stream_one_spawn(args, sid, cur_user_text=None):
                 _mu = (e.get("message") or {}).get("usage")
                 if isinstance(_mu, dict):
                     last_msg_usage = _mu
+                _msg = e.get("message") or {}
+                _blocks = _msg.get("content") if isinstance(_msg, dict) else []
+                _texts = [
+                    block.get("text")
+                    for block in (_blocks or [])
+                    if isinstance(block, dict) and block.get("type") == "text"
+                ]
+                _classified = _classify_engine_error(e.get("error"), *_texts)
+                if _classified or e.get("error"):
+                    engine_error_code = _classified or "engine_error"
                 continue
 
         # 循环正常退出(timeout-break / EOF-without-result)而 result 分支没跑到 →
@@ -960,6 +999,9 @@ async def _stream_one_spawn(args, sid, cur_user_text=None):
                     )
                     if _is_thinking_flag_rejected(stderr_txt):
                         att["flag_rejected"] = True
+                    _stderr_code = _classify_engine_error(stderr_txt)
+                    if _stderr_code or proc.returncode not in (None, 0):
+                        att["error_code"] = _stderr_code or "engine_error"
             yield {"_attempt": att}
     finally:
         if proc.returncode is None:
@@ -1047,13 +1089,15 @@ def _log_turn_usage(usage_dict, sid, model):
 
 
 def _derive_empty_reason(rate_limited=False, thinking_emitted=False,
-                         interrupted=False, emitted_any=False):
+                         interrupted=False, emitted_any=False, error_code=None):
     """空退轮的机器可读原因(2026-08-03 · 留痕):后端据此落 metadata + 选兜底文案。
       · rate_limited            —— 引擎探到额度真耗尽(rate_limit_event 非 allowed)。
       · interrupted             —— 被 deadline / budget / turns 兜底闸截断且零正文。
       · no_text_after_thinking  —— **想了但一个字没说**(思考链已流出)。
       · tool_only_no_text       —— 只声明了工具没出正文(副作用不可重放 · 没走重试)。
       · no_output               —— 整轮零输出(经典秒空退)。"""
+    if error_code:
+        return error_code
     if rate_limited:
         return "rate_limited"
     if interrupted:
@@ -1068,7 +1112,7 @@ def _derive_empty_reason(rate_limited=False, thinking_emitted=False,
 def _build_done_ev(full, parts, cc_thinking_full, think_secs,
                    rate_limited=False, saw_synthetic=False, interrupted=False,
                    cc_turn_tokens=None, cc_turn_usage=None,
-                   activities=None, visible_events=None, empty_reason=None):
+                   activities=None, visible_events=None, empty_reason=None, error_code=None):
     """把一次 CC attempt 组装成对外 `done`;不输出 Codex/旧通用 usage/thinking 键。"""
     done_ev = {
         "done": True,
@@ -1082,6 +1126,8 @@ def _build_done_ev(full, parts, cc_thinking_full, think_secs,
     if not done_ev["full"] and empty_reason:
         done_ev["empty_turn"] = True
         done_ev["empty_reason"] = empty_reason
+    if error_code:
+        done_ev["error_code"] = error_code
     # 只接受 Claude thinking_delta / transcript thinking 汇成的 CC 专属全文。
     if cc_thinking_full:
         done_ev["cc_thinking_full"] = cc_thinking_full
@@ -1249,7 +1295,8 @@ async def stream_headless(text, resume_sid=None, model=None, effort=None):
             "full": "", "parts": [], "cc_thinking_full": "", "think_secs": None,
             "cc_turn_tokens": None, "cc_turn_usage": None,
             "actual_sid": sid, "emitted_any": False, "thinking_emitted": False,
-            "activities": [], "visible_events": [], "rate_limited": False, "saw_synthetic": False, "interrupted": False,
+            "activities": [], "visible_events": [], "rate_limited": False, "saw_synthetic": False,
+            "error_code": None, "interrupted": False,
         }
         # 续接:本轮 spawn 真正写入的 transcript sid(forge 裁过 / 全新起会变)→ 下轮重试
         # 同 sid `--resume`(指针已在 spawn 内 write_last_session)。
@@ -1261,6 +1308,7 @@ async def stream_headless(text, resume_sid=None, model=None, effort=None):
         emitted_any = bool(result.get("emitted_any"))
         thinking_emitted = bool(result.get("thinking_emitted"))
         interrupted = bool(result.get("interrupted"))
+        engine_error_code = result.get("error_code")
         # 空退判定:本轮**没产出任何正文**(full 空)。emitted_any 单独把闸:
         # 哪怕 full 空,只要已 yield 过**正文/工具**给客户端,也**绝不重试**(防双回复 /
         # 副作用重放)。2026-08-03:思考链不算(thinking_emitted 单独记 · 不闸重试)。
@@ -1297,7 +1345,9 @@ async def stream_headless(text, resume_sid=None, model=None, effort=None):
                     thinking_emitted=thinking_emitted,
                     interrupted=interrupted,
                     emitted_any=emitted_any,
+                    error_code=engine_error_code,
                 ) if is_empty else None,
+                error_code=engine_error_code,
             )
             return
 
@@ -1314,6 +1364,20 @@ async def stream_headless(text, resume_sid=None, model=None, effort=None):
                 "process · retry sid=%s without it (degraded: no live thinking chain)", sid,
             )
             continue
+
+        if engine_error_code:
+            yield _build_done_ev(
+                "", result.get("parts"),
+                _attempt_cc_value(result, "cc_thinking_full", "reasoning_full"),
+                result.get("think_secs"),
+                rate_limited=bool(result.get("rate_limited")),
+                saw_synthetic=bool(result.get("saw_synthetic")),
+                activities=result.get("activities"),
+                visible_events=result.get("visible_events"),
+                empty_reason=engine_error_code,
+                error_code=engine_error_code,
+            )
+            return
 
         # ① salvage 优先:第一次 spawn 可能其实往 transcript 写了 turn(parse race /
         #    synthetic 残片)· 读出来用 · 别盲目重 spawn(防双生成)。
@@ -1379,6 +1443,8 @@ async def stream_headless(text, resume_sid=None, model=None, effort=None):
             empty_reason=_derive_empty_reason(
                 rate_limited=bool(result.get("rate_limited")),
                 thinking_emitted=thinking_emitted,
+                error_code=engine_error_code,
             ),
+            error_code=engine_error_code,
         )
         return
