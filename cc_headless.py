@@ -257,6 +257,37 @@ def _archive_policy_blocked_session(sid):
         return None
 
 
+def _last_policy_refusal_category(events):
+    for event in reversed(events or []):
+        if not isinstance(event, dict) or event.get("type") != "assistant":
+            continue
+        message = event.get("message") or {}
+        if not isinstance(message, dict):
+            return None
+        texts = " ".join(
+            str(block.get("text") or "")
+            for block in (message.get("content") or [])
+            if isinstance(block, dict) and block.get("type") == "text"
+        )
+        return _policy_refusal_category(
+            message.get("stop_reason"), message.get("stop_details"), texts,
+            synthetic=message.get("model") == "<synthetic>",
+        )
+    return None
+
+
+def _session_policy_refusal_category(sid):
+    if not sid:
+        return None
+    try:
+        path = forge.session_path(sid)
+        if not path or not os.path.exists(path):
+            return None
+        return _last_policy_refusal_category(forge.read_jsonl(path))
+    except Exception:  # noqa: BLE001
+        return None
+
+
 def _policy_replay_safe(attempt):
     if not isinstance(attempt, dict) or attempt.get("emitted_any") or attempt.get("activities"):
         return False
@@ -1331,6 +1362,27 @@ async def stream_headless(text, resume_sid=None, model=None, effort=None):
         sid = _resolve_resume_sid(resume_sid, resume_max=th.resume_max)
     except Exception:  # noqa: BLE001 · 解析炸就全新起(失败安全)
         sid = None
+    # Preflight a persisted policy refusal before the current input reaches the provider.
+    # A poisoned resume may otherwise throw a generic exception before structured events.
+    policy_preflight_category = _session_policy_refusal_category(sid)
+    policy_preflight_recovered = False
+    if policy_preflight_category:
+        old_sid = sid
+        archived = _archive_policy_blocked_session(old_sid)
+        if not archived:
+            logger.warning(
+                "cc policy preflight(category=%s) · quarantine failed sid=%s · no execution",
+                policy_preflight_category, old_sid)
+            yield _build_done_ev(
+                "", [], "", None, empty_reason="policy_blocked",
+                error_code="policy_blocked", policy_category=policy_preflight_category,
+            )
+            return
+        sid = None  # keep the pointer until the fresh init atomically replaces it
+        policy_preflight_recovered = True
+        logger.warning(
+            "cc policy preflight(category=%s) · quarantined sid=%s · fresh execution 1/1",
+            policy_preflight_category, old_sid)
     # Re-derive thresholds from the model that is ACTUALLY running (safety floor).
     # Intent vs actual can disagree indefinitely across context-window variants, and
     # computing from the intent lets the session grow past the real window.
@@ -1383,7 +1435,7 @@ async def stream_headless(text, resume_sid=None, model=None, effort=None):
             pass
 
     attempt = 0
-    policy_retried = False
+    policy_retried = policy_preflight_recovered
     while True:
         # ⚠️ resume 用本轮**实际写入**的 sid(spawn 内 system/init 落盘的 actual_sid)·
         # 重试同 sid `--resume`(同一条 user 输入续上文)· 不动 sid 生成/指针/forge 逻辑。
