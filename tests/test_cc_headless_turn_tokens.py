@@ -235,6 +235,19 @@ def test_stream_structured_policy_refusal_uses_stable_code(monkeypatch):
     assert attempts[0]["full"] == ""
 
 
+def test_policy_archive_is_atomic_for_concurrent_preflight(monkeypatch, tmp_path):
+    transcript = tmp_path / "sid-old.jsonl"
+    transcript.write_text("{}\n", encoding="utf-8")
+    monkeypatch.setattr(cc_headless.forge, "session_path", lambda sid: str(transcript))
+
+    winner = cc_headless._archive_policy_blocked_session("sid-old")
+    loser = cc_headless._archive_policy_blocked_session("sid-old")
+
+    assert winner and loser is None
+    assert not transcript.exists()
+    assert len(list(tmp_path.glob("sid-old.jsonl.policy-blocked-*"))) == 1
+
+
 # ③ done wire contract：只写 CC 专属字段 ─────────────────────────────────────
 def test_build_done_ev_uses_only_cc_usage_contract():
     usage = cc_headless._extract_cc_turn_usage({
