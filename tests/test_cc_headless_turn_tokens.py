@@ -248,6 +248,39 @@ def test_policy_archive_is_atomic_for_concurrent_preflight(monkeypatch, tmp_path
     assert len(list(tmp_path.glob("sid-old.jsonl.policy-blocked-*"))) == 1
 
 
+def test_policy_archive_scrubs_refusal_prose_but_preserves_diagnostics(monkeypatch, tmp_path):
+    transcript = tmp_path / "sid-old.jsonl"
+    events = [
+        {"type": "user", "message": {"content": "original user text"}},
+        {"type": "assistant", "message": {
+            "model": "<synthetic>", "stop_reason": "refusal",
+            "stop_details": {
+                "type": "refusal", "category": "reasoning_extraction",
+                "explanation": "provider refusal prose should disappear",
+            },
+            "content": [{"type": "text", "text": "provider refusal prose should disappear"}],
+        }},
+    ]
+    original_user_line = json.dumps(events[0], ensure_ascii=False) + "\n"
+    transcript.write_text(
+        original_user_line + json.dumps(events[1], ensure_ascii=False) + "\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(cc_headless.forge, "session_path", lambda sid: str(transcript))
+
+    archived = cc_headless._archive_policy_blocked_session("sid-old")
+
+    lines = open(archived, encoding="utf-8").readlines()
+    assert lines[0] == original_user_line
+    sanitized = json.loads(lines[1])
+    assert sanitized["message"]["content"][0]["text"] == "出现了一些问题"
+    assert sanitized["message"]["stop_details"] == {
+        "type": "refusal", "category": "reasoning_extraction",
+    }
+    assert "provider refusal prose" not in "".join(lines)
+    assert cc_headless._last_policy_refusal_category([sanitized]) == "reasoning_extraction"
+
+
 # ③ done wire contract：只写 CC 专属字段 ─────────────────────────────────────
 def test_build_done_ev_uses_only_cc_usage_contract():
     usage = cc_headless._extract_cc_turn_usage({

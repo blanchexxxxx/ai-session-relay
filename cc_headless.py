@@ -252,9 +252,72 @@ def _archive_policy_blocked_session(sid):
             return None
         archived = f"{path}.policy-blocked-{time.time_ns()}"
         os.replace(path, archived)
+        if not _sanitize_archived_policy_refusal(archived):
+            logger.warning("cc policy archive sanitized no refusal text · sid=%s", sid)
         return archived
     except Exception:  # noqa: BLE001
         return None
+
+
+def _sanitize_archived_policy_refusal(path):
+    """Atomically scrub refusal prose from an archived policy session.
+
+    Keep stop_reason and stop_details type/category for route diagnostics, replace only the
+    confirmed assistant text, and drop stop_details.explanation because it duplicates provider
+    prose on the observed Claude transcript schema. Every unrelated JSONL line remains byte-stable.
+    """
+    tmp = f"{path}.sanitize-tmp-{os.getpid()}-{time.time_ns()}"
+    try:
+        with open(path, encoding="utf-8") as src:
+            lines = src.readlines()
+        target_index = None
+        target_event = None
+        for index in range(len(lines) - 1, -1, -1):
+            try:
+                event = json.loads(lines[index])
+            except (TypeError, ValueError, json.JSONDecodeError):
+                continue
+            if not isinstance(event, dict) or event.get("type") != "assistant":
+                continue
+            if _last_policy_refusal_category([event]):
+                target_index, target_event = index, event
+            break
+        if target_event is None:
+            return False
+
+        message = target_event.get("message")
+        if not isinstance(message, dict):
+            return False
+        changed = False
+        for block in message.get("content") or []:
+            if isinstance(block, dict) and block.get("type") == "text":
+                block["text"] = "出现了一些问题"
+                changed = True
+        stop_details = message.get("stop_details")
+        if isinstance(stop_details, dict) and "explanation" in stop_details:
+            stop_details.pop("explanation", None)
+            changed = True
+        if not changed:
+            return False
+
+        had_newline = lines[target_index].endswith("\n")
+        lines[target_index] = json.dumps(
+            target_event, ensure_ascii=False, separators=(",", ":"),
+        ) + ("\n" if had_newline else "")
+        with open(tmp, "x", encoding="utf-8", newline="") as dst:
+            dst.writelines(lines)
+            dst.flush()
+            os.fsync(dst.fileno())
+        os.replace(tmp, path)
+        return True
+    except Exception:  # noqa: BLE001
+        return False
+    finally:
+        try:
+            if os.path.exists(tmp):
+                os.unlink(tmp)
+        except OSError:
+            pass
 
 
 def _last_policy_refusal_category(events):
