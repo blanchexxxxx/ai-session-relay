@@ -33,6 +33,20 @@ def test_provider_failures_are_reduced_to_stable_public_codes():
     assert classify("private implementation detail") is None
 
 
+def test_structured_policy_refusal_category_beats_explanation_text():
+    assert cc_headless._policy_refusal_category(
+        "refusal", {"category": "reasoning_extraction"}, "unrelated",
+    ) == "reasoning_extraction"
+    assert cc_headless._policy_refusal_category(
+        None, None, "reverse engineering or duplicating model outputs",
+        synthetic=True,
+    ) == "reasoning_extraction"
+    assert cc_headless._policy_refusal_category(
+        None, None, "ordinary assistant discussion of usage policy",
+        synthetic=False,
+    ) is None
+
+
 def test_done_event_carries_public_error_code_without_raw_detail():
     event = cc_headless._build_done_ev(
         "", [], "", None,
@@ -200,6 +214,25 @@ def test_explicit_unknown_result_error_uses_generic_engine_code(monkeypatch):
     attempts = asyncio.run(_collect(["claude"], "sid-x"))
 
     assert attempts[0]["error_code"] == "engine_error"
+
+
+def test_stream_structured_policy_refusal_uses_stable_code(monkeypatch):
+    refusal = {"type": "stream_event", "event": {
+        "type": "message_delta",
+        "delta": {
+            "stop_reason": "refusal",
+            "stop_details": {"category": "reasoning_extraction"},
+        },
+    }}
+    result_ev = {"type": "result", "subtype": "success",
+                 "result": "provider policy explanation must stay private"}
+    _patch_spawn(monkeypatch, [json.dumps(refusal), json.dumps(result_ev)])
+
+    attempts = asyncio.run(_collect(["claude"], "sid-x"))
+
+    assert attempts[0]["error_code"] == "policy_blocked"
+    assert attempts[0]["policy_category"] == "reasoning_extraction"
+    assert attempts[0]["full"] == ""
 
 
 # ③ done wire contract：只写 CC 专属字段 ─────────────────────────────────────

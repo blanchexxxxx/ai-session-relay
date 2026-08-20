@@ -6,7 +6,7 @@ It is intentionally only a local HTTP/NDJSON service. There is no web UI, databa
 
 ## What it keeps
 
-- Claude Code: persistent session pointer, safe resume fallback, transcript forge/trim, and empty-turn recovery.
+- Claude Code: persistent session pointer, safe resume fallback, transcript forge/trim, empty-turn recovery, and one fresh-session replay for structured policy refusals only when no text or tool side effect was emitted.
 - Codex: persistent `app-server`, model-aware between-turn pre-rotation, atomic handoff/pointer commit, `thread/resume`, turn-id-correlated live/rollout recovery, and one safe retry only after the old transport is dead and the rollout proves the turn never started. Transport silence never deletes a durable thread pointer.
 - Engine switching: one local JSON state file with the active provider, a monotonic epoch, and a bounded recent handoff.
 - Streaming: the existing `delta`, activity, provider-specific thinking/usage, and final `done` NDJSON events.

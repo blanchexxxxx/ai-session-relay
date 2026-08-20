@@ -187,6 +187,12 @@ def _classify_engine_error(*values):
     if not text:
         return None
     if any(marker in text for marker in (
+        "usage policy", "reasoning_extraction", "reasoning extraction",
+        "reverse engineering or duplicating model outputs",
+        "terms of service restrictions", "request was blocked",
+    )):
+        return "policy_blocked"
+    if any(marker in text for marker in (
         "authentication_failed", "not logged in", "please run /login",
         "authentication failed", "unauthorized", "oauth token has expired",
     )):
@@ -201,6 +207,63 @@ def _classify_engine_error(*values):
     )):
         return "model_unavailable"
     return None
+
+
+_POLICY_STOP_REASONS = {"refusal", "content_filter", "content-filter"}
+_POLICY_FALLBACK_MARKERS = (
+    "usage policy", "reverse engineering or duplicating model outputs",
+    "terms of service restrictions", "reasoning_extraction", "reasoning extraction",
+)
+
+
+def _policy_refusal_category(stop_reason=None, stop_details=None, explanation=None,
+                             *, synthetic=False):
+    """Prefer structured refusal metadata; use English text only for synthetic errors."""
+    reason = str(stop_reason or "").strip().lower().replace("-", "_")
+    if isinstance(stop_details, dict):
+        category = str(stop_details.get("category") or "").strip().lower().replace("-", "_")
+        detail_type = str(stop_details.get("type") or "").strip().lower().replace("-", "_")
+    else:
+        category = str(getattr(stop_details, "category", "") or "").strip().lower().replace("-", "_")
+        detail_type = str(getattr(stop_details, "type", "") or "").strip().lower().replace("-", "_")
+    if category == "reasoning_extraction":
+        return category
+    if reason in {value.replace("-", "_") for value in _POLICY_STOP_REASONS}:
+        return category or ("content_filter" if reason == "content_filter" else "policy")
+    if detail_type in {"refusal", "content_filter"}:
+        return category or ("content_filter" if detail_type == "content_filter" else "policy")
+    if synthetic:
+        text = str(explanation or "").lower()
+        if any(marker in text for marker in _POLICY_FALLBACK_MARKERS):
+            return "reasoning_extraction" if (
+                "reasoning_extraction" in text or "reasoning extraction" in text
+                or "duplicating model outputs" in text
+            ) else "policy"
+    return None
+
+
+def _archive_policy_blocked_session(sid):
+    """Atomically quarantine the refused transcript outside ``*.jsonl`` resume candidates."""
+    if not sid:
+        return "<fresh>"
+    try:
+        path = forge.session_path(sid)
+        if not path or not os.path.exists(path):
+            return None
+        archived = f"{path}.policy-blocked-{time.time_ns()}"
+        os.replace(path, archived)
+        return archived
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _policy_replay_safe(attempt):
+    if not isinstance(attempt, dict) or attempt.get("emitted_any") or attempt.get("activities"):
+        return False
+    return not any(
+        isinstance(part, dict) and part.get("type") == "tool"
+        for part in (attempt.get("parts") or [])
+    )
 
 
 def read_last_session():
@@ -656,6 +719,7 @@ async def _stream_one_spawn(args, sid, cur_user_text=None):
     rate_limited = False        # 见 rate_limit_event(额度信号 · 观测用)
     saw_synthetic = False       # 见 <synthetic> 占位残片(额度压力空退信号 · 观测用)
     engine_error_code = None    # provider/CLI explicit failure; raw text stays private
+    policy_category = None      # structured refusal category (safe metadata only)
     cc_thinking_full = ""       # 本轮 CC 思考链明文(summarized 走 live;omitted 在 result 后读 transcript)
     cc_thinking_live = []       # 2026-06-25 · live thinking_delta 明文累积(summarized 模型如 opus-4.6 /
                                 # sonnet-4.6 实时吐摘要)· 非空 = 本轮已 live 转发思考 → result 不再从
@@ -710,6 +774,7 @@ async def _stream_one_spawn(args, sid, cur_user_text=None):
             "rate_limited": rate_limited,
             "saw_synthetic": saw_synthetic,
             "error_code": engine_error_code,
+            "policy_category": policy_category,
             "interrupted": interrupted,
         }
 
@@ -773,7 +838,16 @@ async def _stream_one_spawn(args, sid, cur_user_text=None):
             if t == "stream_event":
                 ev = e.get("event") or {}
                 et = ev.get("type")
-                if et == "content_block_start":
+                if et in {"message_start", "message_delta"}:
+                    structured = ev.get("message") if et == "message_start" else ev.get("delta")
+                    structured = structured if isinstance(structured, dict) else {}
+                    category = _policy_refusal_category(
+                        structured.get("stop_reason"), structured.get("stop_details"),
+                    )
+                    if category:
+                        engine_error_code = "policy_blocked"
+                        policy_category = category
+                elif et == "content_block_start":
                     cb = ev.get("content_block") or {}
                     cur_block = cb.get("type")
                     if cur_block == "text":
@@ -863,14 +937,28 @@ async def _stream_one_spawn(args, sid, cur_user_text=None):
             if t == "result":
                 _flush_text()
                 _flush_tools()
+                _result_category = _policy_refusal_category(
+                    e.get("stop_reason"), e.get("stop_details"),
+                    " ".join(str(value or "") for value in (e.get("error"), e.get("result"))),
+                    synthetic=bool(e.get("is_error")),
+                )
+                if _result_category:
+                    policy_category = _result_category
+                    engine_error_code = "policy_blocked"
                 # result.result 是 CLI 给的权威全文;没有就回落已累积 final_text。
                 # 写回 final_text 让 _make_attempt 取到同一个值(它读 final_text)。
-                final_text = (e.get("result") or final_text or "").strip()
+                final_text = ("" if (policy_category and not emitted_any) else
+                              (e.get("result") or final_text or "").strip())
                 if e.get("is_error") or str(e.get("subtype") or "").startswith("error"):
-                    engine_error_code = (
-                        _classify_engine_error(e.get("subtype"), e.get("error"), e.get("result"))
-                        or "engine_error"
-                    )
+                    if not policy_category:
+                        engine_error_code = (
+                            _classify_engine_error(e.get("subtype"), e.get("error"), e.get("result"))
+                            or "engine_error"
+                        )
+                        if engine_error_code == "policy_blocked":
+                            policy_category = "policy"
+                            if not emitted_any:
+                                final_text = ""
 
                 # 学模型上下文窗口(#173 · 不写死 forge 阈值):result.modelUsage.<model>.contextWindow
                 # 是 CC 自己报的真实窗口 → 持久 → 下轮 forge 阈值用真值(opus-4-8 实测 1M)。失败安全。
@@ -971,7 +1059,20 @@ async def _stream_one_spawn(args, sid, cur_user_text=None):
                     for block in (_blocks or [])
                     if isinstance(block, dict) and block.get("type") == "text"
                 ]
-                _classified = _classify_engine_error(e.get("error"), *_texts)
+                _synthetic = isinstance(_msg, dict) and _msg.get("model") == "<synthetic>"
+                _category = _policy_refusal_category(
+                    _msg.get("stop_reason") if isinstance(_msg, dict) else None,
+                    _msg.get("stop_details") if isinstance(_msg, dict) else None,
+                    " ".join(str(value or "") for value in _texts), synthetic=_synthetic,
+                )
+                if _category:
+                    engine_error_code = "policy_blocked"
+                    policy_category = _category
+                    continue
+                # Ordinary assistant prose must never be scanned for policy/error markers.
+                _classified = _classify_engine_error(
+                    e.get("error"), *(_texts if (_synthetic or e.get("error")) else [])
+                )
                 if _classified or e.get("error"):
                     engine_error_code = _classified or "engine_error"
                 continue
@@ -1112,7 +1213,8 @@ def _derive_empty_reason(rate_limited=False, thinking_emitted=False,
 def _build_done_ev(full, parts, cc_thinking_full, think_secs,
                    rate_limited=False, saw_synthetic=False, interrupted=False,
                    cc_turn_tokens=None, cc_turn_usage=None,
-                   activities=None, visible_events=None, empty_reason=None, error_code=None):
+                   activities=None, visible_events=None, empty_reason=None, error_code=None,
+                   policy_category=None, policy_session_recovered=False):
     """把一次 CC attempt 组装成对外 `done`;不输出 Codex/旧通用 usage/thinking 键。"""
     done_ev = {
         "done": True,
@@ -1128,6 +1230,10 @@ def _build_done_ev(full, parts, cc_thinking_full, think_secs,
         done_ev["empty_reason"] = empty_reason
     if error_code:
         done_ev["error_code"] = error_code
+    if error_code == "policy_blocked" and policy_category:
+        done_ev["policy_category"] = policy_category
+    if policy_session_recovered:
+        done_ev["policy_session_recovered"] = True
     # 只接受 Claude thinking_delta / transcript thinking 汇成的 CC 专属全文。
     if cc_thinking_full:
         done_ev["cc_thinking_full"] = cc_thinking_full
@@ -1277,6 +1383,7 @@ async def stream_headless(text, resume_sid=None, model=None, effort=None):
             pass
 
     attempt = 0
+    policy_retried = False
     while True:
         # ⚠️ resume 用本轮**实际写入**的 sid(spawn 内 system/init 落盘的 actual_sid)·
         # 重试同 sid `--resume`(同一条 user 输入续上文)· 不动 sid 生成/指针/forge 逻辑。
@@ -1296,7 +1403,7 @@ async def stream_headless(text, resume_sid=None, model=None, effort=None):
             "cc_turn_tokens": None, "cc_turn_usage": None,
             "actual_sid": sid, "emitted_any": False, "thinking_emitted": False,
             "activities": [], "visible_events": [], "rate_limited": False, "saw_synthetic": False,
-            "error_code": None, "interrupted": False,
+            "error_code": None, "policy_category": None, "interrupted": False,
         }
         # 续接:本轮 spawn 真正写入的 transcript sid(forge 裁过 / 全新起会变)→ 下轮重试
         # 同 sid `--resume`(指针已在 spawn 内 write_last_session)。
@@ -1309,10 +1416,27 @@ async def stream_headless(text, resume_sid=None, model=None, effort=None):
         thinking_emitted = bool(result.get("thinking_emitted"))
         interrupted = bool(result.get("interrupted"))
         engine_error_code = result.get("error_code")
+        policy_category = result.get("policy_category")
         # 空退判定:本轮**没产出任何正文**(full 空)。emitted_any 单独把闸:
         # 哪怕 full 空,只要已 yield 过**正文/工具**给客户端,也**绝不重试**(防双回复 /
         # 副作用重放)。2026-08-03:思考链不算(thinking_emitted 单独记 · 不闸重试)。
         is_empty = not full
+
+        if (engine_error_code == "policy_blocked" and not policy_retried
+                and _policy_replay_safe(result)):
+            old_sid = sid
+            archived = _archive_policy_blocked_session(old_sid)
+            if archived:
+                policy_retried = True
+                sid = None
+                attempt = 0
+                logger.warning(
+                    "cc policy refusal(category=%s) · quarantined sid=%s · "
+                    "fresh-session replay 1/1", policy_category or "policy", old_sid)
+                continue
+            logger.warning(
+                "cc policy refusal(category=%s) · quarantine failed sid=%s · no replay",
+                policy_category or "policy", old_sid)
 
         # ── 已出文 / 已流出正文或工具 / 截断且已吐思考 → 直接收口,不 salvage/不重试 ──
         # 截断(timeout-break / EOF-without-result)带回已吐正文的 attempt 落这里:
@@ -1348,10 +1472,29 @@ async def stream_headless(text, resume_sid=None, model=None, effort=None):
                     error_code=engine_error_code,
                 ) if is_empty else None,
                 error_code=engine_error_code,
+                policy_category=policy_category,
+                policy_session_recovered=policy_retried,
             )
             return
 
         # ── 此处:本轮零正文 + 客户端零输出 = 空退 ──
+        if policy_retried and engine_error_code != "policy_blocked":
+            yield _build_done_ev(
+                "", result.get("parts"),
+                _attempt_cc_value(result, "cc_thinking_full", "reasoning_full"),
+                result.get("think_secs"),
+                rate_limited=bool(result.get("rate_limited")),
+                saw_synthetic=bool(result.get("saw_synthetic")),
+                activities=result.get("activities"), visible_events=result.get("visible_events"),
+                empty_reason=_derive_empty_reason(
+                    rate_limited=bool(result.get("rate_limited")),
+                    thinking_emitted=thinking_emitted, interrupted=interrupted,
+                    emitted_any=emitted_any, error_code=engine_error_code,
+                ),
+                error_code=engine_error_code, policy_session_recovered=True,
+            )
+            return
+
         # ⓪ flag 被 CLI 拒(auto-update 改/删了未公开的 `--thinking-display`)→ 不是真空退,
         #    是 spawn 被这个 flag 顶死。关掉 flag、同 sid 重试一次(自愈)· **不吃**空退重试
         #    预算(`attempt` 不增 · 这是确定性修复不是 flaky 空退)· 本进程级一次性:关了之后
@@ -1376,6 +1519,8 @@ async def stream_headless(text, resume_sid=None, model=None, effort=None):
                 visible_events=result.get("visible_events"),
                 empty_reason=engine_error_code,
                 error_code=engine_error_code,
+                policy_category=policy_category,
+                policy_session_recovered=policy_retried,
             )
             return
 
@@ -1446,5 +1591,7 @@ async def stream_headless(text, resume_sid=None, model=None, effort=None):
                 error_code=engine_error_code,
             ),
             error_code=engine_error_code,
+            policy_category=policy_category,
+            policy_session_recovered=policy_retried,
         )
         return
