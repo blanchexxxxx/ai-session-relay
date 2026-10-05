@@ -252,9 +252,72 @@ def _archive_policy_blocked_session(sid):
             return None
         archived = f"{path}.policy-blocked-{time.time_ns()}"
         os.replace(path, archived)
+        if not _sanitize_archived_policy_refusal(archived):
+            logger.warning("cc policy archive sanitized no refusal text · sid=%s", sid)
         return archived
     except Exception:  # noqa: BLE001
         return None
+
+
+def _sanitize_archived_policy_refusal(path):
+    """Atomically scrub refusal prose from an archived policy session.
+
+    Keep stop_reason and stop_details type/category for route diagnostics, replace only the
+    confirmed assistant text, and drop stop_details.explanation because it duplicates provider
+    prose on the observed Claude transcript schema. Every unrelated JSONL line remains byte-stable.
+    """
+    tmp = f"{path}.sanitize-tmp-{os.getpid()}-{time.time_ns()}"
+    try:
+        with open(path, encoding="utf-8") as src:
+            lines = src.readlines()
+        target_index = None
+        target_event = None
+        for index in range(len(lines) - 1, -1, -1):
+            try:
+                event = json.loads(lines[index])
+            except (TypeError, ValueError, json.JSONDecodeError):
+                continue
+            if not isinstance(event, dict) or event.get("type") != "assistant":
+                continue
+            if _last_policy_refusal_category([event]):
+                target_index, target_event = index, event
+            break
+        if target_event is None:
+            return False
+
+        message = target_event.get("message")
+        if not isinstance(message, dict):
+            return False
+        changed = False
+        for block in message.get("content") or []:
+            if isinstance(block, dict) and block.get("type") == "text":
+                block["text"] = "出现了一些问题"
+                changed = True
+        stop_details = message.get("stop_details")
+        if isinstance(stop_details, dict) and "explanation" in stop_details:
+            stop_details.pop("explanation", None)
+            changed = True
+        if not changed:
+            return False
+
+        had_newline = lines[target_index].endswith("\n")
+        lines[target_index] = json.dumps(
+            target_event, ensure_ascii=False, separators=(",", ":"),
+        ) + ("\n" if had_newline else "")
+        with open(tmp, "x", encoding="utf-8", newline="") as dst:
+            dst.writelines(lines)
+            dst.flush()
+            os.fsync(dst.fileno())
+        os.replace(tmp, path)
+        return True
+    except Exception:  # noqa: BLE001
+        return False
+    finally:
+        try:
+            if os.path.exists(tmp):
+                os.unlink(tmp)
+        except OSError:
+            pass
 
 
 def _last_policy_refusal_category(events):
@@ -709,6 +772,132 @@ def _salvage_turn(sid, cur_user_text=""):
         return "", []
 
 
+# ── 单次 API 调用计时 + 重试事件留痕 ──────────────────────────────────────────────
+# 一轮回得慢时,单看总耗时分不清是「工具轮数多」还是「某次 API 调用卡住 / CLI 内部重试」。
+# 每次调用收尾(message_stop)记一行:墙钟时刻 / 耗时 / 首包 / usage / stop_reason;慢调用或
+# 「疑似隐藏重试」(cache_creation=0 但新增内容全落 cache_read)升 WARNING。CLI 吐的 system
+# 重试 / 错误事件也原样摘要成 WARNING。
+try:
+    _API_CALL_SLOW_SECS = max(1.0, float(os.getenv("CC_API_CALL_SLOW_SECS", "120")))
+except (TypeError, ValueError):
+    _API_CALL_SLOW_SECS = 120.0
+# 「疑似隐藏重试」判据余量:cache_read 比上一次调用的完整前缀多出这么多 token 才算。
+# 正常调用的新增段(上次输出 + tool_result)应落 cache_creation;cw=0 却把新增段读出来 =
+# 这段前缀之前已被某次请求写进缓存 = 同一请求发过不止一次。
+_RETRY_SUSPECT_MARGIN = 1024
+
+
+def _usage_int(usage, key):
+    try:
+        return int((usage or {}).get(key) or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+class _ApiCallClock:
+    """一次 spawn 内逐次 API 调用的计时器(纯逻辑 · now/wall 可注入便于单测)。
+
+    请求起点:spawn 时刻(首调 · 含 CLI 冷启几秒)· 之后每个 tool_result(`user` 事件)重置 ——
+    CLI 拿到工具结果才发下一次请求。message_start = 首包(TTFB)+ 输入侧 usage;
+    message_delta 带累计 output_tokens + stop_reason;message_stop = 本次调用结束 → 出一行日志。
+    """
+
+    def __init__(self, now=time.monotonic, wall=time.time):
+        self._now = now
+        self._wall = wall
+        self.index = 0
+        self.retries = 0            # 本次调用期间收到的 system 重试事件数
+        self.prev_prefix = None     # 上一次调用的完整输入前缀(input + cache_read + cache_creation)
+        self._req_ts = now()
+        self._ttfb = None
+        self._usage = {}
+        self._stop_reason = None
+        self._starts = 0            # 同一次调用里 message_start 次数(>1 = 流内重来)
+
+    def mark_request(self):
+        """新请求起点(tool_result 回来之后)。"""
+        self._req_ts = self._now()
+        self._ttfb = None
+        self._usage = {}
+        self._stop_reason = None
+        self._starts = 0
+        self.retries = 0
+
+    def note_retry(self):
+        self.retries += 1
+
+    def on_message_start(self, message):
+        message = message if isinstance(message, dict) else {}
+        self._starts += 1
+        if self._ttfb is None:
+            self._ttfb = self._now() - self._req_ts
+        usage = message.get("usage")
+        if isinstance(usage, dict):
+            self._usage = dict(usage)
+
+    def on_message_delta(self, event):
+        event = event if isinstance(event, dict) else {}
+        usage = event.get("usage")
+        if isinstance(usage, dict) and usage.get("output_tokens") is not None:
+            self._usage["output_tokens"] = usage.get("output_tokens")
+        delta = event.get("delta")
+        if isinstance(delta, dict) and delta.get("stop_reason"):
+            self._stop_reason = delta.get("stop_reason")
+
+    def on_message_stop(self):
+        """本次调用收尾 → 返回 (level, line);随即为下一次调用重置起点。"""
+        self.index += 1
+        dur = self._now() - self._req_ts
+        ttfb = self._ttfb if self._ttfb is not None else dur
+        inp = _usage_int(self._usage, "input_tokens")
+        cr = _usage_int(self._usage, "cache_read_input_tokens")
+        cw = _usage_int(self._usage, "cache_creation_input_tokens")
+        out = _usage_int(self._usage, "output_tokens")
+        flags = []
+        if dur >= _API_CALL_SLOW_SECS:
+            flags.append(f"slow≥{_API_CALL_SLOW_SECS:g}s")
+        if self.retries:
+            flags.append(f"retry_events={self.retries}")
+        if self._starts > 1:
+            flags.append(f"message_start×{self._starts}")
+        if (cw == 0 and self.prev_prefix is not None
+                and cr > self.prev_prefix + _RETRY_SUSPECT_MARGIN):
+            flags.append(
+                f"suspect_hidden_retry(cw=0 · cr +{cr - self.prev_prefix} over prev prefix)")
+        line = (
+            "cc_headless api_call #%d @%s · dur=%.1fs ttfb=%.1fs · in=%d cr=%d cw=%d out=%d · stop=%s%s"
+            % (self.index, time.strftime("%H:%M:%S", time.localtime(self._wall())),
+               dur, ttfb, inp, cr, cw, out, self._stop_reason or "-",
+               (" · ⚠ " + " · ".join(flags)) if flags else "")
+        )
+        self.prev_prefix = inp + cr + cw
+        level = logging.WARNING if flags else logging.INFO
+        self.mark_request()
+        return level, line
+
+
+_SYSTEM_EVENT_FIELDS = ("attempt", "max_retries", "retry_delay_ms", "error_status")
+
+
+def _system_event_log_line(e):
+    """CLI 的 system 重试 / 错误事件 → 摘要行(None = 不是这类事件,不记)。
+
+    只认 subtype 含 retry / error 的(如 `api_retry`);init / hook_* / status 等噪声跳过。
+    error 原文截 200 字(API 错误文本不含凭据,但防超长刷屏)。
+    """
+    sub = str(e.get("subtype") or "")
+    low = sub.lower()
+    if "retry" not in low and "error" not in low:
+        return None
+    bits = [f"{k}={e.get(k)}" for k in _SYSTEM_EVENT_FIELDS if e.get(k) is not None]
+    err = e.get("error")
+    if err is not None:
+        err = err if isinstance(err, str) else json.dumps(err, ensure_ascii=False)
+        bits.append("error=" + err.replace("\n", " ")[:200])
+    return "cc_headless system/%s @%s%s" % (
+        sub, time.strftime("%H:%M:%S"), (" · " + " · ".join(bits)) if bits else "")
+
+
 async def _stream_one_spawn(args, sid, cur_user_text=None):
     """一次 `claude -p` spawn:解析 NDJSON → yield 实时 cc 事件(delta / part_break /
     cc_thinking_delta / tool_activity)· **不** yield `done`。轮结束时 yield 一个内部
@@ -810,6 +999,7 @@ async def _stream_one_spawn(args, sid, cur_user_text=None):
         }
 
     _turn_start = time.monotonic()
+    call_clock = _ApiCallClock()   # 逐次 API 调用耗时 + 疑似隐藏重试 → 日志
     try:
         while True:
             # 单轮总时长闸:撞顶即截断(脱缰思考链持续吐 delta · 下面单次 readline 静默闸永不触发 ·
@@ -856,6 +1046,11 @@ async def _stream_one_spawn(args, sid, cur_user_text=None):
                     if new_sid:
                         actual_sid = new_sid     # 本轮真正写入的 transcript sid(读 thinking 用)
                         write_last_session(new_sid)
+                else:
+                    _sys_line = _system_event_log_line(e)
+                    if _sys_line:
+                        call_clock.note_retry()
+                        logger.warning(_sys_line)
                 continue
 
             if t == "rate_limit_event":
@@ -869,6 +1064,13 @@ async def _stream_one_spawn(args, sid, cur_user_text=None):
             if t == "stream_event":
                 ev = e.get("event") or {}
                 et = ev.get("type")
+                if et == "message_start":
+                    call_clock.on_message_start(ev.get("message"))
+                elif et == "message_delta":
+                    call_clock.on_message_delta(ev)
+                elif et == "message_stop":
+                    _lvl, _call_line = call_clock.on_message_stop()
+                    logger.log(_lvl, _call_line)
                 if et in {"message_start", "message_delta"}:
                     structured = ev.get("message") if et == "message_start" else ev.get("delta")
                     structured = structured if isinstance(structured, dict) else {}
@@ -941,13 +1143,14 @@ async def _stream_one_spawn(args, sid, cur_user_text=None):
                         yield {"tool_activity": {"steps": list(pending_steps)}}
                     cur_block = None
                     cur_tool_id = None
-                # message_start / message_delta / message_stop → 忽略
+                # message_start / message_delta / message_stop → 只喂上面的 call_clock 计时
                 continue
 
             if t == "user":
                 # Tool completions arrive as synthetic user messages in Claude's structured
                 # stream. Pair them with the original tool_use id for an expandable result.
                 content = (e.get("message") or {}).get("content")
+                call_clock.mark_request()   # 工具结果回来 → CLI 随即发下一次请求
                 if isinstance(content, list):
                     for block in content:
                         if not isinstance(block, dict) or block.get("type") != "tool_result":

@@ -846,7 +846,7 @@ FORGE_RESUME_MAX_RATIO = 1.5
 # 老对话不丢:压给 DAG vault(session_start @vault_recall 召回)。⚠️ 只夹**大窗口**:200k 模型
 # trigger=140k/retain=75k 本就 < cap → no-op(不破 4.6/sonnet 历史安全属性)。可调:agent忘事抬
 # RETAIN_CAP(80k≈30轮 → 120k≈60轮);冷启还多降 TRIGGER_CAP。
-FORGE_TRIGGER_CAP = 250_000   # cut 上界(大窗口 fable/opus-4-8)· 2026-07-06 400k→250k(user:省 fable token)
+FORGE_TRIGGER_CAP = 500_000   # cut 上界(所有 1M 级模型)· 2026-10-05 250k→500k(少裁 = 少换 sid 冷启;代价是每次调用上下文 / cache_read 约翻倍)
                               # ≈ 地板(~117k:人设 52k + 20 轮 retain ~65k)+ √(40·地板·每轮增长~4k) ≈ 最优点。
                               # 133k 余量 → ~33 轮/forge · 不撞地板(≠ 2026-07-05 试的 200k:那时地板~200k 卡触发线狂裁)。
                               # 只影响 1M 模型(fable/opus-4-8);200k 模型(4.6/sonnet)trigger=window-60k=140k < cap 不受此帽。
