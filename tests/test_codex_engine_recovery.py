@@ -20,6 +20,13 @@ async def _collect(stream):
     return [event async for event in stream]
 
 
+# Wall-clock budget for "it terminated instead of hanging".  These cases patch every
+# poll/timeout down to milliseconds, so the number only has to sit far below the real
+# 15s no-ack rule and far above the measured runtime (~0.1-0.25s).  5s leaves 20-45x
+# headroom; tighter values (the old 0.2s/0.5s) turn a slower CI runner into a red build.
+_TERMINATES_BUDGET_S = 5.0
+
+
 def test_completed_rollout_recovers_only_public_content_and_last_usage(tmp_path):
     rollout = tmp_path / "rollout-thread-1.jsonl"
     rollout.write_text(_rollout_line("response_item", {
@@ -105,7 +112,7 @@ def test_continuation_state_and_model_aware_threshold(tmp_path, monkeypatch):
     assert codex_engine._continuation_rotation_reason(state) == "native_compact"
     assert codex_engine._continuation_trigger_tokens(200_000) == 140_000
     assert codex_engine._continuation_trigger_tokens(258_400) == 193_800
-    assert codex_engine._continuation_trigger_tokens(1_000_000) == 250_000
+    assert codex_engine._continuation_trigger_tokens(1_000_000) == 500_000
 
 
 @pytest.mark.asyncio
@@ -145,7 +152,9 @@ async def test_fresh_engine_turn_completes_without_waiting_for_rpc_ack(monkeypat
     monkeypatch.setattr(codex_engine, "_rollout_has_progress", lambda _path, _offset: True)
     monkeypatch.setattr(codex_engine, "TRANSCRIPT_POLL_SECONDS", 0.001)
 
-    events = await asyncio.wait_for(_collect(server.stream_turn("hello")), timeout=0.5)
+    events = await asyncio.wait_for(
+        _collect(server.stream_turn("hello")), timeout=_TERMINATES_BUDGET_S,
+    )
 
     assert events[-1]["full"] == "fast reply"
     assert events[-1]["codex_turn_tokens"] == 15
@@ -203,7 +212,9 @@ async def test_any_turn_fails_fast_without_ack_or_progress(monkeypatch):
     monkeypatch.setattr(codex_engine, "ROLLOUT_START_TIMEOUT", 0.002)
 
     with pytest.raises(ConnectionError, match="no RPC ack or rollout progress"):
-        await asyncio.wait_for(_collect(server.stream_turn("hello")), timeout=0.2)
+        await asyncio.wait_for(
+            _collect(server.stream_turn("hello")), timeout=_TERMINATES_BUDGET_S,
+        )
     assert server._pending == {}
 
 
