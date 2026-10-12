@@ -195,6 +195,10 @@ def _classify_engine_error(*values):
     if any(marker in text for marker in (
         "authentication_failed", "not logged in", "please run /login",
         "authentication failed", "unauthorized", "oauth token has expired",
+        # Observed CLI wording for an expired OAuth token without a refresh token:
+        # "Failed to authenticate. API Error: 401 OAuth access token has expired.
+        # Re-authenticate to continue." -- the marker above does not match it.
+        "oauth access token has expired", "failed to authenticate", "re-authenticate",
     )):
         return "auth_required"
     if any(marker in text for marker in (
